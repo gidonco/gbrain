@@ -8,9 +8,9 @@ const AUTOPILOT_SRC = readFileSync(join(import.meta.dir, '../src/commands/autopi
 describe('generateSystemdUnit', () => {
   const unit = generateSystemdUnit('/home/u/.gbrain/autopilot-run.sh');
 
-  test('uses Restart=always (NOT on-failure) so a clean exit-for-relaunch respawns', () => {
-    expect(unit).toContain('Restart=always');
-    expect(unit).not.toContain('Restart=on-failure');
+  test('uses bounded failure-only restarts so clean exits stay stopped', () => {
+    expect(unit).toContain('Restart=on-failure');
+    expect(unit).not.toContain('Restart=always');
   });
   test('caps a clean-exit respawn storm with StartLimit*', () => {
     expect(unit).toContain('StartLimitIntervalSec=');
@@ -27,17 +27,15 @@ describe('autopilot self-upgrade static-shape regressions', () => {
     expect(AUTOPILOT_SRC).not.toMatch(/execve\s*\(/);
     expect(AUTOPILOT_SRC).not.toMatch(/execvp\s*\(/);
   });
-  test('the silent channel does swap-only, never a blocking full post-upgrade in the tick', () => {
-    expect(AUTOPILOT_SRC).toContain("execSync('gbrain upgrade --swap-only'");
-    // The tick must not invoke the (up-to-30-min) post-upgrade inline.
-    expect(AUTOPILOT_SRC).not.toContain("execSync('gbrain post-upgrade'");
+  test('the silent channel is disabled under fail-stop supervisors', () => {
+    expect(AUTOPILOT_SRC).not.toContain("execSync('gbrain upgrade --swap-only'");
+    expect(AUTOPILOT_SRC).toContain('self-upgrade disabled under fail-stop supervisor policy');
   });
   test('boot reconciles the breadcrumb and the tick attempts the channel', () => {
     expect(AUTOPILOT_SRC).toContain('reconcileSelfUpgradeAtBoot()');
     expect(AUTOPILOT_SRC).toContain('attemptAutopilotSelfUpgrade(engine, engineType, lockPath)');
   });
-  test('apply path unlinks the lock before exit so the relaunched binary does not self-exit on a stale lock', () => {
-    // The exit-for-relaunch block unlinks lockPath then process.exit(0).
-    expect(AUTOPILOT_SRC).toMatch(/unlinkSync\(lockPath\)[\s\S]{0,120}process\.exit\(0\)/);
+  test('autopilot never exits cleanly expecting a supervisor relaunch', () => {
+    expect(AUTOPILOT_SRC).not.toContain('exiting for supervisor relaunch');
   });
 });

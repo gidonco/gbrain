@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## Unreleased
+
+### Fixed
+- **Autopilot cost guardrails:** generated installs enforce a two-hour floor, fail stopped, disable supervisor-dependent silent self-upgrades, and default autonomous/provider retries to a single attempt. Interactive autopilot retains its historical adaptive cadence unless `--min-interval` is explicitly supplied.
+- **Daily AI budget:** priced gateway calls share an atomic DB-backed cap, refresh cap configuration live, fail closed on invalid/unreadable configuration, settle tracker-less embeddings, release no-transport refusals, and cover canonical chat plus hosted ZeroEntropy reranker pricing.
+
 ## [0.42.62.0] - 2026-07-17
 
 **If your brain holds more than one source, everything now lands in the right one. Link extraction, timeline extraction, background cycles, and webhook captures used to quietly file some of their output under the default source; all of those paths now carry the correct source identity. Background agent jobs got tougher too: a failed database reconnect can no longer wedge the engine, and workers recover from dropped connections instead of crash-looping. If you run the admin dashboard behind a reverse proxy, the live activity panel finally connects. Long agent conversations cost less because repeated context is reused between turns on Anthropic calls. Local LiteLLM proxies work out of the box. Nested sources scan correctly again instead of reporting zero files. And the project's automated checks now include dependency vulnerability scanning, static code-security analysis, and signed provenance for release builds. Thirty merged changes in all, the largest batch to date, each one reviewed and verified against the live codebase before landing.**

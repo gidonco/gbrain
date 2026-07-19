@@ -27,17 +27,10 @@ import { loadConfig, saveConfig, gbrainPath as gbrainHomePath } from '../core/co
 import { ChildWorkerSupervisor } from '../core/minions/child-worker-supervisor.ts';
 import { VERSION } from '../version.ts';
 import {
-  canSelfUpdate,
-  decideSelfUpgrade,
-  isCacheFresh,
-  readUpdateCache,
   reconcileBreadcrumb,
   resolveSelfUpgradeMode,
 } from '../core/self-upgrade.ts';
 import { logSelfUpgrade } from '../core/audit/self-upgrade-audit.ts';
-import { detectInstallMethod } from './upgrade.ts';
-import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
-import { inspectLock } from '../core/db-lock.ts';
 
 /**
  * v0.37.7.0 #1162 — classify autopilot reconnect-loop errors.
@@ -197,148 +190,34 @@ function reconcileSelfUpgradeAtBoot(): void {
   }
 }
 
-/** Conservative idle: no cycle running AND (Postgres) no active/waiting jobs.
- * Any ambiguity / error → NOT idle (we'd rather skip an upgrade window). */
-async function computeAutopilotIdle(engine: BrainEngine, engineType: string): Promise<boolean> {
-  try {
-    const cycle = await inspectLock(engine, 'gbrain-cycle');
-    if (cycle) return false; // a cycle (sync/extract/embed/...) is running
-    if (engineType === 'postgres') {
-      const rows = await (engine as any).executeRaw?.(
-        `SELECT count(*)::int AS n FROM minion_jobs WHERE status IN ('active','waiting')`,
-      );
-      const busy = Number((rows as Array<{ n: number }>)?.[0]?.n ?? 0);
-      return busy === 0;
-    }
-    return true; // pglite: no separate worker queue; cycle-lock-free is the signal
-  } catch {
-    return false;
-  }
-}
-
 /**
- * The autopilot silent self-upgrade channel. Opt-in (`self_upgrade.mode=auto`).
- * Fires only when behind + idle + in quiet hours + the install can self-update
- * and the target isn't known-bad. On apply: write the breadcrumb, run
- * `gbrain upgrade --swap-only` (fast; defers post-upgrade to the relaunch),
- * then unlink the autopilot lock and exit(0) so the supervisor relaunches the
- * new binary (no in-process re-exec — Bun has no execve). Never throws.
+ * Cost-safety policy: generated supervisors deliberately fail stopped, so
+ * autopilot cannot exit cleanly expecting launchd/systemd to relaunch it.
+ * Upgrades remain an explicit operator action (`gbrain upgrade`).
  */
+let selfUpgradePolicyLogged = false;
 async function attemptAutopilotSelfUpgrade(
-  engine: BrainEngine,
-  engineType: string,
-  lockPath: string,
+  _engine: BrainEngine,
+  _engineType: string,
+  _lockPath: string,
 ): Promise<void> {
   try {
     const cfg = loadConfig();
     if (!cfg) return;
     if (resolveSelfUpgradeMode(cfg) !== 'auto') return;
-
-    // latestVersion from the shared cache; refresh when stale (TTL throttles fetch).
-    let entry = readUpdateCache();
-    if (!entry || !isCacheFresh(entry, Date.now())) {
-      try {
-        const { refreshUpdateCache } = await import('./check-update.ts');
-        await refreshUpdateCache();
-        entry = readUpdateCache();
-      } catch {
-        /* fail-open */
-      }
+    if (!selfUpgradePolicyLogged) {
+      selfUpgradePolicyLogged = true;
+      console.warn('[autopilot] self-upgrade disabled under fail-stop supervisor policy; run `gbrain upgrade` explicitly.');
     }
-    if (!entry || entry.marker.kind !== 'upgrade_available' || !entry.marker.latest) return;
-    const latestVersion = entry.marker.latest;
-
-    const idle = await computeAutopilotIdle(engine, engineType);
-    const qh = cfg.self_upgrade?.quiet_hours;
-    const tz = qh?.tz || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-    const verdict = evaluateQuietHours({ start: qh?.start ?? 23, end: qh?.end ?? 8, tz }, new Date());
-    const installMethod = detectInstallMethod();
-
-    const decision = decideSelfUpgrade({
-      mode: 'auto',
-      channel: 'autopilot',
-      currentVersion: VERSION,
-      latestVersion,
-      failedVersions: cfg.self_upgrade?.failed_versions ?? [],
-      idle,
-      inQuietHours: verdict !== 'allow',
-      canSelfUpdate: canSelfUpdate(installMethod),
-      throttledByInterval: false, // cache TTL is the fetch throttle
-    });
-
-    if (decision.action !== 'apply') {
-      if (['unsupported_install', 'known_bad'].includes(decision.action)) {
-        logSelfUpgrade({
-          channel: 'autopilot',
-          action: decision.action,
-          current: VERSION,
-          latest: latestVersion,
-          outcome: 'skipped',
-          reason: decision.reason,
-        });
-      }
-      return;
-    }
-
-    // Apply. Breadcrumb first so a crash-on-launch is attributable.
-    cfg.self_upgrade = { ...(cfg.self_upgrade ?? {}), attempting_version: latestVersion };
-    saveConfig(cfg);
-    logSelfUpgrade({ channel: 'autopilot', action: 'apply', current: VERSION, latest: latestVersion, reason: decision.reason });
-    console.log(`[autopilot] self-upgrade: applying ${VERSION} -> ${latestVersion} (idle, quiet hours).`);
-
-    try {
-      execSync('gbrain upgrade --swap-only', {
-        stdio: 'inherit',
-        timeout: 300_000,
-        env: { ...process.env, GBRAIN_SKIP_STARTUP_HOOKS: '1' },
-      });
-    } catch (e) {
-      const fresh = loadConfig();
-      if (fresh) {
-        const failed = new Set(fresh.self_upgrade?.failed_versions ?? []);
-        failed.add(latestVersion);
-        fresh.self_upgrade = { ...(fresh.self_upgrade ?? {}), failed_versions: [...failed] };
-        delete fresh.self_upgrade.attempting_version;
-        saveConfig(fresh);
-      }
-      logSelfUpgrade({
-        channel: 'autopilot',
-        action: 'apply',
-        current: VERSION,
-        latest: latestVersion,
-        outcome: 'failed',
-        error: e instanceof Error ? e.message : String(e),
-      });
-      console.error(`[autopilot] self-upgrade swap failed; staying on ${VERSION}.`);
-      return;
-    }
-
-    // Swap done + smoke-verified by `upgrade --swap-only`. Exit cleanly so the
-    // supervisor relaunches the NEW binary, which reconciles the breadcrumb.
-    logSelfUpgrade({
-      channel: 'autopilot',
-      action: 'apply',
-      current: VERSION,
-      latest: latestVersion,
-      outcome: 'applied',
-      reason: 'swapped; exiting for supervisor relaunch',
-    });
-    console.log('[autopilot] self-upgrade swapped; exiting for relaunch.');
-    try {
-      unlinkSync(lockPath);
-    } catch {
-      /* already gone */
-    }
-    process.exit(0);
   } catch {
-    /* the self-upgrade channel must never break the tick */
+    /* policy reporting must never break the tick */
   }
 }
 
 export async function runAutopilot(engine: BrainEngine, args: string[]) {
   if (args.includes('--help') || args.includes('-h')) {
     console.log(
-      'Usage: gbrain autopilot [--repo <path>] [--interval N] [--json] [--no-worker]\n' +
+      'Usage: gbrain autopilot [--repo <path>] [--interval N] [--min-interval N] [--json] [--no-worker]\n' +
       '       gbrain autopilot --install [--repo <path>]\n' +
       '       gbrain autopilot --uninstall\n' +
       '       gbrain autopilot --status [--json]\n\n' +
@@ -364,6 +243,9 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
 
   const repoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
   const baseInterval = parseInt(parseArg(args, '--interval') || '300', 10);
+  // Preserve the historical adaptive cadence unless an operator explicitly
+  // supplies a floor. Generated installs always supply the 7,200s floor.
+  const minimumInterval = parseInt(parseArg(args, '--min-interval') || '60', 10);
   const jsonMode = args.includes('--json');
   const forceInline = args.includes('--inline');
   const noWorker = !shouldSpawnAutopilotWorker(args);
@@ -699,7 +581,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                   {
                     queue: 'default',
                     idempotency_key: `autopilot-sync:${src.id}:${slot}`,
-                    max_attempts: 2,
+                    max_attempts: 1,
                     timeout_ms: timeoutMs,
                     maxWaiting: 1,
                   },
@@ -959,7 +841,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
               const submitOpts = {
                 queue: 'default',
                 idempotency_key: step.idempotency_key,
-                max_attempts: 2,
+                max_attempts: 1,
                 timeout_ms: timeoutMs,
                 maxWaiting: 1,
               };
@@ -1016,13 +898,11 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     }
 
     // 4. Health check + adaptive interval (same for both paths)
-    let interval = baseInterval;
+    let interval = resolveAutopilotInterval(baseInterval, 50, minimumInterval);
     try {
       const health = await engine.getHealth();
       const score = (health as any).brain_score ?? 50;
-      interval = score >= 90 ? baseInterval * 2
-               : score < 70 ? Math.max(Math.floor(baseInterval / 2), 60)
-               : baseInterval;
+      interval = resolveAutopilotInterval(baseInterval, score, minimumInterval);
 
       const elapsed = ((Date.now() - cycleStart) / 1000).toFixed(0);
       const line = `[cycle] score=${score} elapsed=${elapsed}s next=${interval}s`;
@@ -1077,6 +957,26 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     // Wait for next cycle
     await new Promise(r => setTimeout(r, interval * 1000));
   }
+}
+
+/** Adaptive cadence with an operator-controlled hard floor. */
+export function resolveAutopilotInterval(
+  baseSeconds: number,
+  brainScore: number,
+  minimumSeconds: number,
+): number {
+  const safeBase = Number.isFinite(baseSeconds) && baseSeconds > 0
+    ? Math.max(60, Math.floor(baseSeconds))
+    : 300;
+  const safeMinimum = Number.isFinite(minimumSeconds) && minimumSeconds > 0
+    ? Math.max(60, Math.floor(minimumSeconds))
+    : safeBase;
+  const adaptive = brainScore >= 90
+    ? safeBase * 2
+    : brainScore < 70
+      ? Math.max(Math.floor(safeBase / 2), 60)
+      : safeBase;
+  return Math.max(adaptive, safeMinimum);
 }
 
 // --- Install/Uninstall ---
@@ -1165,7 +1065,7 @@ function writeWrapperScript(repoPath: string): string {
 # OPENAI/ANTHROPIC keys exported in zshenv reach autopilot.
 [ -f ~/.zshenv ] && source ~/.zshenv 2>/dev/null
 source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true
-exec '${safeGbrainPath}' autopilot --repo '${safeRepoPath}'
+exec '${safeGbrainPath}' autopilot --repo '${safeRepoPath}' --interval 7200 --min-interval 7200
 `;
   writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
   return wrapperPath;
@@ -1219,15 +1119,11 @@ export function generateLaunchdPlist(wrapperPath: string, home: string): string 
     <string>${escapeXml(wrapperPath)}</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><false/>
   <!--
-    v0.37.7.0 #1162: ThrottleInterval=60 forces launchd to wait at
-    least 60s between relaunches. Combined with the in-process
-    classifier (recoverable vs unrecoverable in the supervisor loop),
-    this prevents the spinning respawn pattern where an unrecoverable
-    error (missing database_url, malformed config) immediately
-    relaunched and re-hit the same error. ThrottleInterval is a hard
-    floor; launchd would have applied a default of 10s if unset.
+    Cost-safety: fatal exits stay stopped. RunAtLoad starts the daemon at
+    login, while KeepAlive=false prevents repeated billable work after an
+    unrecoverable configuration, provider, or database failure.
   -->
   <key>ThrottleInterval</key><integer>60</integer>
   <key>StandardOutPath</key><string>${escapeXml(home)}/.gbrain/autopilot.log</string>
@@ -1262,27 +1158,22 @@ function installLaunchd(wrapperPath: string, home: string, repoPath: string) {
 /**
  * Generate the gbrain-autopilot systemd user unit.
  *
- * v0.42: `Restart=always` (was `on-failure`). The self-upgrade silent channel
- * does swap-only + `exit(0)` and relies on the supervisor to relaunch the new
- * binary — there is no in-process re-exec (Bun has no `execve`). `on-failure`
- * would NOT relaunch on a clean exit, silently killing the daemon after it
- * upgraded itself. `StartLimitIntervalSec`/`StartLimitBurst` cap a clean-exit
- * respawn storm (systemd's analog to the launchd `ThrottleInterval=60`).
- *
- * Exported so the v0.42 migration can recognize the prior generated shape and
- * rewrite existing `on-failure` units in place.
+ * Cost-safe supervisor definition. Failed processes have a small bounded
+ * restart allowance, while clean exits remain stopped. This prevents a bad
+ * configuration or repeated paid-provider failure from becoming an unbounded
+ * respawn loop.
  */
 export function generateSystemdUnit(wrapperPath: string): string {
   return `[Unit]
 Description=GBrain Autopilot
 After=network-online.target
 StartLimitIntervalSec=300
-StartLimitBurst=10
+StartLimitBurst=3
 
 [Service]
 Type=simple
 ExecStart=${wrapperPath}
-Restart=always
+Restart=on-failure
 RestartSec=30
 StandardOutput=append:%h/.gbrain/autopilot.log
 StandardError=append:%h/.gbrain/autopilot.err
@@ -1293,55 +1184,12 @@ WantedBy=default.target
 }
 
 /**
- * v0.42 migration: rewrite an existing `Restart=on-failure` autopilot systemd
- * unit to `Restart=always` so the self-upgrade silent channel's clean
- * exit-for-relaunch actually respawns. HARD-GUARDED: only rewrites a unit that
- * matches the known gbrain-generated shape (never a hand-edited one), only
- * user-level units (never system, never needs root), Linux only. Idempotent:
- * a no-op once already `Restart=always`. Best-effort; called from runPostUpgrade.
+ * Back-compatible post-upgrade hook. The former migration promoted units to
+ * `Restart=always`; cost-safety policy now deliberately leaves them fail-stop.
+ * Keep the export so older upgrade code can call it safely.
  */
 export function migrateSystemdUnitToRestartAlways(): { rewritten: boolean; reason: string } {
-  if (process.platform !== 'linux') return { rewritten: false, reason: 'not-linux' };
-  let unitPath: string;
-  try {
-    unitPath = systemdUnitPath();
-  } catch {
-    return { rewritten: false, reason: 'no-unit-path' };
-  }
-  if (!existsSync(unitPath)) return { rewritten: false, reason: 'no-unit' };
-  let content: string;
-  try {
-    content = readFileSync(unitPath, 'utf8');
-  } catch {
-    return { rewritten: false, reason: 'unreadable' };
-  }
-  if (!content.includes('Restart=on-failure')) {
-    return { rewritten: false, reason: 'already-migrated' };
-  }
-  // Hard guard: must look like OUR generated unit, not a hand-edited one.
-  const execMatch = content.match(/ExecStart=(\S+)/);
-  const looksGenerated =
-    content.includes('Description=GBrain Autopilot') &&
-    content.includes('StandardOutput=append:%h/.gbrain/autopilot.log') &&
-    !!execMatch;
-  if (!looksGenerated) {
-    process.stderr.write(
-      '[gbrain] autopilot systemd unit looks hand-edited; NOT rewriting Restart=on-failure. ' +
-        'Set Restart=always manually so self-upgrade relaunch works.\n',
-    );
-    return { rewritten: false, reason: 'hand-edited' };
-  }
-  try {
-    writeFileSync(unitPath, generateSystemdUnit(execMatch![1]));
-    try {
-      execSync('systemctl --user daemon-reload', { stdio: 'pipe', timeout: 10_000 });
-    } catch {
-      /* daemon-reload best-effort */
-    }
-    return { rewritten: true, reason: 'rewritten' };
-  } catch (e) {
-    return { rewritten: false, reason: e instanceof Error ? e.message : 'write-failed' };
-  }
+  return { rewritten: false, reason: 'cost-safety-policy' };
 }
 
 function installSystemd(wrapperPath: string, repoPath: string) {
@@ -1434,9 +1282,9 @@ echo \$! > ~/.gbrain/autopilot.pid
 }
 
 function installCrontab(wrapperPath: string, home: string) {
-  // Linux/WSL without systemd — crontab runs the wrapper every 5 minutes.
+  // Linux/WSL without systemd — crontab starts autopilot every two hours.
   const safeWrapperPath = wrapperPath.replace(/'/g, "'\\''");
-  const cronLine = `*/5 * * * * '${safeWrapperPath}' >> '${home.replace(/'/g, "'\\''")}/.gbrain/autopilot.log' 2>&1`;
+  const cronLine = `0 */2 * * * '${safeWrapperPath}' >> '${home.replace(/'/g, "'\\''")}/.gbrain/autopilot.log' 2>&1`;
   try {
     const existing = execSync('crontab -l 2>/dev/null || true', { encoding: 'utf-8' });
     if (existing.includes('gbrain autopilot') || existing.includes('autopilot-run.sh')) {
@@ -1448,7 +1296,7 @@ function installCrontab(wrapperPath: string, home: string) {
     writeFileSync(tmpFile, existing.trimEnd() + '\n' + cronLine + '\n');
     execSync(`crontab '${tmpFile.replace(/'/g, "'\\''")}'`, { stdio: 'pipe' });
     try { unlinkSync(tmpFile); } catch { /* best-effort */ }
-    console.log('Installed crontab entry for gbrain autopilot (every 5 minutes)');
+    console.log('Installed crontab entry for gbrain autopilot (every 2 hours)');
     console.log('  Uninstall: gbrain autopilot --uninstall');
   } catch (e: unknown) {
     console.error(`Failed to install crontab: ${e instanceof Error ? e.message : e}`);

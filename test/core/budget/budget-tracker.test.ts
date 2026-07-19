@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import {
   BudgetTracker,
   BudgetExhausted,
+  costForUsage,
   extractUsageFromError,
   _resetBudgetTrackerWarningsForTest,
 } from '../../../src/core/budget/budget-tracker.ts';
@@ -59,6 +60,15 @@ function readAudit(): Array<Record<string, unknown>> {
 }
 
 describe('BudgetTracker.reserve', () => {
+  test('canonical OpenAI and Google chat pricing is available to hard caps', () => {
+    expect(costForUsage('openai:gpt-4o', 1_000_000, 1_000_000, 'chat')).toBe(12.5);
+    expect(costForUsage('google:gemini-2.0-flash', 1_000_000, 1_000_000, 'chat')).toBe(0.5);
+  });
+
+  test('default hosted ZeroEntropy reranker has non-zero pricing', () => {
+    expect(costForUsage('zeroentropyai:zerank-2', 1_000_000, 0, 'rerank')).toBe(0.025);
+  });
+
   test('passes when under cap with known pricing', () => {
     const t = new BudgetTracker({ maxCostUsd: 1.0, label: 'test', auditPath });
     expect(() =>
@@ -135,7 +145,7 @@ describe('BudgetTracker.reserve', () => {
     expect(caught).toBeInstanceOf(BudgetExhausted);
     expect((caught as BudgetExhausted).reason).toBe('no_pricing');
     expect((caught as BudgetExhausted).modelId).toBe('mystery:some-unreleased-model');
-    expect((caught as Error).message).toMatch(/anthropic-pricing\.ts/);
+    expect((caught as Error).message).toMatch(/model-pricing\.ts/);
   });
 
   test('v0.41.20.0: slash-prefix anthropic/claude-* under --max-cost does NOT no_pricing throw (THE FIX)', () => {
