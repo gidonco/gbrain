@@ -486,6 +486,8 @@ export function configureGateway(config: AIGatewayConfig): void {
  */
 export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise<AIGatewayConfig> {
   const cfg = requireConfig();
+  const { armDailyBudgetFromEngine } = await import('../budget/daily-budget.ts');
+  await armDailyBudgetFromEngine(engine);
   // Resolve expansion (utility tier) and chat (reasoning tier). Embedding is
   // intentionally NOT re-resolved here — switching embedding models invalidates
   // the vector index. Out of scope per v0.31.12 plan ("Embedding tier knob").
@@ -521,9 +523,6 @@ export async function reconfigureGatewayWithEngine(engine: BrainEngine): Promise
   ]) {
     if (m) registerExtendedModel(m);
   }
-  const { configureDailyBudget } = await import('../budget/daily-budget.ts');
-  const configuredDailyCap = await engine.getConfig('ai.daily_budget_usd');
-  configureDailyBudget(engine, configuredDailyCap ?? process.env.GBRAIN_DAILY_BUDGET_USD);
   return _config;
 }
 
@@ -1433,15 +1432,6 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
   const charsPerTokenEstimate = recipe.touchpoints?.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
   const totalCharsEstimate = truncated.reduce((s, t) => s + t.length, 0);
   const estimatedEmbedTokens = Math.ceil(totalCharsEstimate / Math.max(charsPerTokenEstimate, 1));
-  const { reserveDailyBudget, settleDailyBudget } = await import('../budget/daily-budget.ts');
-  const dailyReservation = await reserveDailyBudget({
-    modelId: `${recipe.id}:${modelId}`,
-    estimatedInputTokens: estimatedEmbedTokens,
-    maxOutputTokens: 0,
-    kind: 'embed',
-    label: 'gateway.embed',
-  });
-
   // Reserve up front for the worst-case batch token count. Embeddings have
   // no output rate, so maxOutputTokens=0. record() at the end uses the
   // actual total reported by the SDK across all sub-batches.
@@ -1480,6 +1470,17 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
     ? splitByTokenBudget(truncated, Math.floor(maxBatchTokens * effectiveSafetyFactor(recipe)), charsPerToken)
     : [truncated];
 
+  // All local validation and phase-budget checks are complete. Reserve the
+  // persistent daily budget immediately before the first provider transport.
+  const { reserveDailyBudget, settleDailyBudget } = await import('../budget/daily-budget.ts');
+  const dailyReservation = await reserveDailyBudget({
+    modelId: `${recipe.id}:${modelId}`,
+    estimatedInputTokens: estimatedEmbedTokens,
+    maxOutputTokens: 0,
+    kind: 'embed',
+    label: 'gateway.embed',
+  });
+
   const allEmbeddings: Float32Array[] = [];
   let _embedThrew = false;
   try {
@@ -1492,25 +1493,21 @@ export async function embed(texts: string[], opts?: EmbedOpts): Promise<Float32A
     _embedThrew = true;
     throw err;
   } finally {
+    // Embed token usage is not surfaced by the AI SDK shape we use; charge
+    // based on the truncated input character count. This settlement must run
+    // even without a phase-local BudgetTracker (the common search path).
+    const inputTokens = Math.ceil(totalCharsEstimate / Math.max(charsPerTokenEstimate, 1));
+    await settleDailyBudget(dailyReservation, {
+      modelId: `${recipe.id}:${modelId}`,
+      inputTokens,
+      outputTokens: 0,
+      kind: 'embed',
+      embeddingDims: expected,
+    }).catch(() => {
+      // Keep the pending reservation. Expiry charges the estimate, so a
+      // settlement outage cannot restore headroom or mask provider errors.
+    });
     if (tracker) {
-      // Embed token usage is not surfaced by the AI SDK shape we use; charge
-      // based on the truncated input character count using the recipe's
-      // chars-per-token. On failure, A3 amended says charge the pessimistic
-      // estimate too — embed has no output side, so the input estimate IS
-      // the worst case.
-      const charsPerToken = recipe.touchpoints?.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN;
-      const totalChars = truncated.reduce((s, t) => s + t.length, 0);
-      const inputTokens = Math.ceil(totalChars / Math.max(charsPerToken, 1));
-      await settleDailyBudget(dailyReservation, {
-        modelId: `${recipe.id}:${modelId}`,
-        inputTokens,
-        outputTokens: 0,
-        kind: 'embed',
-        embeddingDims: expected,
-      }).catch(() => {
-        // Keep the pending reservation. Expiry charges the estimate, so a
-        // settlement outage cannot restore headroom or mask provider errors.
-      });
       try {
         tracker.record({
           modelId: `${recipe.id}:${modelId}`,
@@ -2990,15 +2987,6 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   }
   const estimatedInputTokens = estimateChatInputTokens(opts);
   const maxOutputTokens = opts.maxTokens ?? defaultMaxOutputTokens(modelStrEarly);
-  const { reserveDailyBudget, settleDailyBudget } = await import('../budget/daily-budget.ts');
-  const dailyReservation = await reserveDailyBudget({
-    modelId: modelStrEarly,
-    estimatedInputTokens,
-    maxOutputTokens,
-    kind: 'chat',
-    label: 'gateway.chat',
-  });
-
   // TX5: reserve BEFORE the provider call. Throws BudgetExhausted on cost,
   // runtime, or no_pricing (when cap is set). Pre-resolution model id is
   // fine here — resolveChatProvider would map aliases the same way for the
@@ -3017,6 +3005,14 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   // touching provider resolution, AI SDK, or any network. See
   // __setChatTransportForTests. Production paths see _chatTransport === null.
   if (_chatTransport) {
+    const { reserveDailyBudget, settleDailyBudget } = await import('../budget/daily-budget.ts');
+    const dailyReservation = await reserveDailyBudget({
+      modelId: modelStrEarly,
+      estimatedInputTokens,
+      maxOutputTokens,
+      kind: 'chat',
+      label: 'gateway.chat',
+    });
     let res: ChatResult | null = null;
     let threw: unknown = null;
     try {
@@ -3123,6 +3119,15 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       // BudgetExhausted (TX1) raised here; surface via next reserve()
     }
   };
+
+  const { reserveDailyBudget, settleDailyBudget } = await import('../budget/daily-budget.ts');
+  const dailyReservation = await reserveDailyBudget({
+    modelId: `${recipe.id}:${modelId}`,
+    estimatedInputTokens,
+    maxOutputTokens,
+    kind: 'chat',
+    label: 'gateway.chat',
+  });
 
   try {
     const result = await _generateTextTransport({
@@ -3622,15 +3627,6 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
     DEFAULT_RERANKER_MODEL;
   const totalChars = input.query.length + input.documents.reduce((s, d) => s + d.length, 0);
   const rerankInputTokens = Math.ceil(totalChars / 4);
-  const { reserveDailyBudget, settleDailyBudget } = await import('../budget/daily-budget.ts');
-  const dailyReservation = await reserveDailyBudget({
-    modelId: modelStr,
-    estimatedInputTokens: rerankInputTokens,
-    maxOutputTokens: 0,
-    kind: 'rerank',
-    label: 'gateway.rerank',
-  });
-
   const tracker = __budgetStore.getStore() ?? null;
   if (tracker) {
     // Reranker pricing isn't in the canonical pricing map today — when no
@@ -3702,6 +3698,17 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   // Build headers from resolveAuth (default applies Bearer-style header).
   const headers = new Headers(authHeaders);
   headers.set('Content-Type', 'application/json');
+
+  // Local model/auth/payload validation is complete. Reserve immediately
+  // before constructing the provider transport and its timeout.
+  const { reserveDailyBudget, settleDailyBudget } = await import('../budget/daily-budget.ts');
+  const dailyReservation = await reserveDailyBudget({
+    modelId: modelStr,
+    estimatedInputTokens: rerankInputTokens,
+    maxOutputTokens: 0,
+    kind: 'rerank',
+    label: 'gateway.rerank',
+  });
 
   // Timeout via AbortController; merges with caller-supplied signal.
   const ctrl = new AbortController();

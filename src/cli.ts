@@ -2199,8 +2199,13 @@ async function connectEngine(opts?: { probeOnly?: boolean }): Promise<BrainEngin
     // re-stamp seam after engine.connect() makes config reads possible.
     const { reconfigureGatewayWithEngine } = await import('./core/ai/gateway.ts');
     await reconfigureGatewayWithEngine(engine);
-  } catch {
-    // Non-fatal. Pre-v39 brains may not have a usable config table yet.
+  } catch (error) {
+    // Budget arming failures are intentionally loud: daily-budget.ts retains
+    // a blocked state so all paid gateway calls fail closed until config reads
+    // recover. Other legacy reconfiguration failures remain non-fatal.
+    if (error instanceof Error && error.name === 'DailyBudgetConfigurationError') {
+      console.error(`[ai-budget] ${error.message}. Paid AI calls will fail closed.`);
+    }
   }
 
   return engine;

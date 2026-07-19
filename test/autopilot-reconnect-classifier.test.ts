@@ -115,6 +115,11 @@ describe('autopilot cost-safety scheduling', () => {
     expect(resolveAutopilotInterval(300, 55, 7_200)).toBe(7_200);
   });
 
+  test('invalid interval input fails safe instead of becoming a zero-delay loop', () => {
+    expect(resolveAutopilotInterval(Number.NaN, 55, Number.NaN)).toBe(300);
+    expect(resolveAutopilotInterval(Number.POSITIVE_INFINITY, 55, 7_200)).toBe(7_200);
+  });
+
   test('systemd restarts only failures and caps restart bursts', () => {
     const unit = generateSystemdUnit('/home/u/.gbrain/autopilot-run.sh');
     expect(unit).toContain('Restart=on-failure');

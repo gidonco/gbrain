@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import type { BrainEngine } from '../../src/core/engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import {
   reserve,
@@ -9,6 +10,7 @@ import {
   clientLockKey,
   BudgetExceededError,
   RESERVATION_TTL_MS,
+  DAILY_AI_BUDGET_CLIENT_ID,
 } from '../../src/core/minions/budget-meter.ts';
 
 let engine: PGLiteEngine;
@@ -53,6 +55,31 @@ describe('minions/budget-meter (v0.38 Slice 2 — D3 reserve-then-settle)', () =
   });
 
   describe('reserve()', () => {
+    it('takes the Postgres advisory lock before reading or writing budget rows', async () => {
+      const calls: string[] = [];
+      const fakePostgres = {
+        kind: 'postgres',
+        transaction: async (fn: (tx: BrainEngine) => Promise<unknown>) => fn(fakePostgres as unknown as BrainEngine),
+        executeRaw: async (query: string) => {
+          calls.push(query);
+          if (query.includes('SELECT pg_advisory_xact_lock')) return [];
+          if (query.includes('UPDATE mcp_spend_reservations')) return [];
+          if (query.includes('AS committed_text')) return [{ committed_text: '0', pending_text: '0' }];
+          if (query.includes('INSERT INTO mcp_spend_reservations')) return [];
+          throw new Error(`unexpected SQL in fake Postgres engine: ${query}`);
+        },
+      } as unknown as BrainEngine;
+
+      await reserve(fakePostgres, {
+        clientId: 'lock-test', estimatedCents: 10, capCents: 100,
+        model: 'm', provider: 'p',
+      });
+
+      expect(calls[0]).toContain('SELECT pg_advisory_xact_lock');
+      expect(calls.findIndex(query => query.includes('AS committed_text'))).toBeGreaterThan(0);
+      expect(calls.findIndex(query => query.includes('INSERT INTO mcp_spend_reservations'))).toBeGreaterThan(0);
+    });
+
     it('passes when projected total ≤ cap', async () => {
       await seedClient('alice', 5.00);
       const r = await reserve(engine, {
@@ -65,6 +92,7 @@ describe('minions/budget-meter (v0.38 Slice 2 — D3 reserve-then-settle)', () =
       expect(r.reservationId).toMatch(/^[0-9a-f-]+$/i);
       expect(r.estimatedCents).toBe(100);
       expect(r.ttlMs).toBe(RESERVATION_TTL_MS);
+      expect(r.ttlMs).toBeGreaterThanOrEqual(2 * 60 * 60 * 1000);
     });
 
     it('refuses with BudgetExceededError when projected > cap', async () => {
@@ -149,7 +177,7 @@ describe('minions/budget-meter (v0.38 Slice 2 — D3 reserve-then-settle)', () =
   });
 
   describe('sweepExpiredReservations()', () => {
-    it('marks past-TTL pending rows as expired', async () => {
+    it('preserves legacy OAuth behavior for expired reservations', async () => {
       await seedClient('alice', 5.00);
       const expired = new Date(Date.now() - 60_000).toISOString();
       await engine.executeRaw(
@@ -164,11 +192,29 @@ describe('minions/budget-meter (v0.38 Slice 2 — D3 reserve-then-settle)', () =
         `SELECT status, actual_cents::text AS actual FROM mcp_spend_reservations WHERE reservation_id = '00000000-0000-0000-0000-000000000001'`,
       );
       expect(rows[0]?.status).toBe('expired');
-      expect(Number(rows[0]?.actual)).toBe(50);
+      expect(Number(rows[0]?.actual)).toBe(0);
       const logged = await engine.executeRaw<Record<string, unknown>>(
-        `SELECT spend_cents::text AS spend FROM mcp_spend_log WHERE client_id = 'alice'`,
+        `SELECT count(*)::int AS n FROM mcp_spend_log WHERE client_id = 'alice'`,
+      );
+      expect(Number(logged[0]?.n)).toBe(0);
+    });
+
+    it('charges expired daily-governor reservations at their estimate', async () => {
+      const expired = new Date(Date.now() - 60_000).toISOString();
+      await engine.executeRaw(
+        `INSERT INTO mcp_spend_reservations
+           (reservation_id, client_id, estimated_cents, model, provider, status, expires_at, created_at)
+         VALUES ('00000000-0000-0000-0000-000000000009', $1, 50, 'm', 'p', 'pending', $2, '2026-01-01T12:00:00Z')`,
+        [DAILY_AI_BUDGET_CLIENT_ID, expired],
+      );
+      expect(await sweepExpiredReservations(engine)).toBe(1);
+      const logged = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT spend_cents::text AS spend, created_at::date::text AS day
+           FROM mcp_spend_log WHERE client_id = $1`,
+        [DAILY_AI_BUDGET_CLIENT_ID],
       );
       expect(Number(logged[0]?.spend)).toBe(50);
+      expect(String(logged[0]?.day)).toBe('2026-01-01');
     });
 
     it('leaves fresh pending rows alone', async () => {
@@ -215,6 +261,25 @@ describe('minions/budget-meter (v0.38 Slice 2 — D3 reserve-then-settle)', () =
           model: 'm', provider: 'p',
         }),
       ).rejects.toThrow(BudgetExceededError);
+    });
+  });
+
+  describe('UTC day-boundary accounting', () => {
+    it('counts pending reservations created before midnight', async () => {
+      await engine.executeRaw(
+        `INSERT INTO mcp_spend_reservations
+           (reservation_id, client_id, estimated_cents, model, provider, status, expires_at, created_at)
+         VALUES ('00000000-0000-0000-0000-000000000008', $1, 80, 'm', 'p', 'pending',
+                 now() + interval '1 hour', now() - interval '1 day')`,
+        [DAILY_AI_BUDGET_CLIENT_ID],
+      );
+      await expect(reserve(engine, {
+        clientId: DAILY_AI_BUDGET_CLIENT_ID,
+        estimatedCents: 30,
+        capCents: 100,
+        model: 'm',
+        provider: 'p',
+      })).rejects.toThrow(BudgetExceededError);
     });
   });
 });

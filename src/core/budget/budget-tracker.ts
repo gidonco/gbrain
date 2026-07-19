@@ -32,6 +32,7 @@ import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { gbrainPath } from '../config.ts';
 import { ANTHROPIC_PRICING, type ModelPricing } from '../anthropic-pricing.ts';
+import { canonicalLookup } from '../model-pricing.ts';
 import { EMBEDDING_PRICING, lookupEmbeddingPrice } from '../embedding-pricing.ts';
 import { splitProviderModelId } from '../model-id.ts';
 import { isoWeekFilename, resolveAuditDir } from '../audit-week-file.ts';
@@ -135,6 +136,12 @@ const FREE_LOCAL_RERANK_PROVIDERS: ReadonlySet<string> = new Set([
   'llama-server-reranker',
 ]);
 
+const PAID_RERANK_PRICING: Readonly<Record<string, ModelPricing>> = {
+  'zeroentropyai:zerank-2': { input: 0.025, output: 0 },
+  'zeroentropyai:zerank-1': { input: 0.025, output: 0 },
+  'zeroentropyai:zerank-1-small': { input: 0.025, output: 0 },
+};
+
 /**
  * Provider id prefixes whose embeddings run on local inference (electricity,
  * not API tokens) and so price at $0. Without this, a `--max-cost`-bounded
@@ -160,15 +167,14 @@ const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
  * per-1M-token price tuple, or null when unknown.
  *
  * Strategy:
- *   - Chat: try the bare model id in ANTHROPIC_PRICING first (legacy keys
- *     are bare claude-* ids). Fall back to the provider-prefixed key.
+ *   - Chat: use the canonical provider/model lookup shared by the gateway,
+ *     covering Anthropic, OpenAI, Google, and aliases.
  *   - Embed: lookupEmbeddingPrice handles the provider:model form; on a miss,
  *     local-inference providers (FREE_LOCAL_EMBED_PROVIDERS) price at $0 so
  *     `--max-cost` callers don't hard-fail.
- *   - Rerank: try ANTHROPIC_PRICING (legacy path for any Claude-priced
- *     rerank); else if the provider half is in FREE_LOCAL_RERANK_PROVIDERS,
- *     return zero pricing so `--max-cost` callers don't TX2 hard-fail on
- *     local inference recipes (electricity, not tokens); else unknown.
+ *   - Rerank: use the hosted reranker input-token table; local providers in
+ *     FREE_LOCAL_RERANK_PROVIDERS return zero pricing; everything else is
+ *     unknown and therefore fails closed when a cap is active.
  */
 function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
   if (kind === 'embed') {
@@ -182,18 +188,18 @@ function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
     }
     return null;
   }
-  // chat or rerank: try bare key first, then provider:model or provider/model.
+  if (kind === 'chat') {
+    return canonicalLookup(modelId) ?? null;
+  }
+  // Rerank uses its own per-input-token table.
   // v0.41.21.0: route through splitProviderModelId so slash-prefixed ids
   // (the form `--judge-model` and OpenRouter recipes emit) hit the pricing
   // table. Pre-fix, slash-form silently no_pricing-failed `--max-cost` on
   // brainstorm/lsd.
-  const bare = ANTHROPIC_PRICING[modelId];
-  if (bare) return bare;
   const { provider: providerId, model: modelTail } = splitProviderModelId(modelId);
-  if (modelTail) {
-    const tailHit = ANTHROPIC_PRICING[modelTail];
-    if (tailHit) return tailHit;
-  }
+  const rerankKey = providerId && modelTail ? `${providerId}:${modelTail}` : modelId;
+  const hostedRerank = PAID_RERANK_PRICING[rerankKey];
+  if (hostedRerank) return hostedRerank;
   // v0.40.6.1: zero-price local-inference rerank providers so the budget
   // tracker's TX2 hard-fail doesn't trip on `llama-server-reranker:<model>`
   // under `--max-cost`. Only the rerank kind — chat/embed already have
@@ -284,8 +290,13 @@ export class BudgetTracker {
         // TX2: hard-fail when a cap is set but pricing is missing — without
         // pricing we can't enforce the cap, and silently ignoring it would
         // void the contract.
+        const pricingFile = estimate.kind === 'embed'
+          ? 'embedding-pricing.ts'
+          : estimate.kind === 'chat'
+            ? 'model-pricing.ts'
+            : 'budget/budget-tracker.ts';
         const msg = `${this.opts.label}: no pricing entry for model "${estimate.modelId}" (kind=${estimate.kind}). ` +
-          `Add it to src/core/${estimate.kind === 'embed' ? 'embedding-pricing.ts' : 'anthropic-pricing.ts'} or drop --max-cost.`;
+          `Add it to src/core/${pricingFile} or drop --max-cost.`;
         this.fireExhausted();
         throw new BudgetExhausted(msg, {
           reason: 'no_pricing',

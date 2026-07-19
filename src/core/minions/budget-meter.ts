@@ -9,9 +9,9 @@
  * and both proceed, total spend = $8. That's the bug. The fix is atomic
  * check-and-reserve under pg_advisory_xact_lock.
  *
- * The lock key is hashed from client_id. Stale reservations (worker
- * crashed before settle) expire after `RESERVATION_TTL_MS` and the
- * sweeper reclaims them on the next reserve call.
+ * The lock key is hashed from client_id. Stale reservations expire after
+ * `RESERVATION_TTL_MS`. Legacy OAuth reservations release their estimate;
+ * daily AI governor reservations stay pessimistically charged.
  *
  * Mirror of the rate-leases.ts pattern (the v0.15 rate-lease helper does
  * the same shape for outbound provider concurrency caps).
@@ -22,9 +22,12 @@ import type { BrainEngine } from '../engine.ts';
 import { sqlQueryForEngine } from '../sql-query.ts';
 import { BudgetExceededError } from '../spend-log.ts';
 
-/** Reservation TTL — 10 minutes. Long enough for any normal subagent call;
- *  short enough that crashed workers don't strand capacity for long. */
-export const RESERVATION_TTL_MS = 10 * 60 * 1000;
+/** Reservation TTL — six hours. This avoids releasing capacity while a slow
+ *  provider call is still legitimately running. */
+export const RESERVATION_TTL_MS = 6 * 60 * 60 * 1000;
+
+/** Internal client whose crashed calls must remain pessimistically charged. */
+export const DAILY_AI_BUDGET_CLIENT_ID = 'gbrain:daily-ai';
 
 /** Generate an int hash of client_id for pg_advisory_xact_lock. */
 function clientLockKey(clientId: string): number {
@@ -51,6 +54,12 @@ export interface Reservation {
   reservationId: string;
   estimatedCents: number;
   ttlMs: number;
+}
+
+function timestampSqlValue(value: unknown): string {
+  if (value instanceof Date) return value.toISOString();
+  const parsed = new Date(String(value));
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : String(value);
 }
 
 /**
@@ -82,21 +91,24 @@ export async function reserve(
 
     // A crashed call is charged at its estimate. Never restore budget
     // headroom merely because the caller disappeared before settlement.
+    const chargeExpiredEstimate = opts.clientId === DAILY_AI_BUDGET_CLIENT_ID;
     const expired = await sql`
       UPDATE mcp_spend_reservations
-         SET status = 'expired', actual_cents = estimated_cents, settled_at = now()
+         SET status = 'expired',
+             actual_cents = CASE WHEN ${chargeExpiredEstimate} THEN estimated_cents ELSE 0 END,
+             settled_at = now()
        WHERE client_id = ${opts.clientId}
          AND status = 'pending'
          AND expires_at < now()
-      RETURNING client_id, estimated_cents, model, provider
+      RETURNING client_id, estimated_cents, model, provider, created_at
     `;
-    for (const row of expired) {
+    for (const row of chargeExpiredEstimate ? expired : []) {
       await sql`
         INSERT INTO mcp_spend_log
-          (client_id, token_name, operation, spend_cents, provider, model)
+          (client_id, token_name, operation, spend_cents, provider, model, created_at)
         VALUES
           (${String(row.client_id)}, ${null}, 'expired_reservation',
-           ${Number(row.estimated_cents)}, ${String(row.provider)}, ${String(row.model)})
+           ${Number(row.estimated_cents)}, ${String(row.provider)}, ${String(row.model)}, ${timestampSqlValue(row.created_at)})
       `;
     }
 
@@ -113,7 +125,6 @@ export async function reserve(
             FROM mcp_spend_reservations
            WHERE client_id = ${opts.clientId}
              AND status = 'pending'
-             AND created_at >= ${todayStart}
         ), '0') AS pending_text
     `;
     const committedCents = parseFloat(String(rows[0]?.committed_text ?? '0'));
@@ -165,16 +176,16 @@ export async function settle(
              settled_at = now()
        WHERE reservation_id = ${reservationId}
          AND status = 'pending'
-      RETURNING client_id, model, provider
+      RETURNING client_id, model, provider, created_at
     `;
     if (updated.length === 0) return;
     const row = updated[0];
     await sql`
       INSERT INTO mcp_spend_log
-        (client_id, token_name, operation, spend_cents, provider, model)
+        (client_id, token_name, operation, spend_cents, provider, model, created_at)
       VALUES
         (${String(row.client_id)}, ${null}, ${operation}, ${actualCents},
-         ${String(row.provider)}, ${String(row.model)})
+         ${String(row.provider)}, ${String(row.model)}, ${timestampSqlValue(row.created_at)})
     `;
   });
 }
@@ -190,18 +201,20 @@ export async function sweepExpiredReservations(engine: BrainEngine): Promise<num
     const sql = sqlQueryForEngine(tx);
     const rows = await sql`
       UPDATE mcp_spend_reservations
-         SET status = 'expired', actual_cents = estimated_cents, settled_at = now()
+         SET status = 'expired',
+             actual_cents = CASE WHEN client_id = ${DAILY_AI_BUDGET_CLIENT_ID} THEN estimated_cents ELSE 0 END,
+             settled_at = now()
        WHERE status = 'pending'
          AND expires_at < now()
-      RETURNING reservation_id, client_id, estimated_cents, model, provider
+      RETURNING reservation_id, client_id, estimated_cents, model, provider, created_at
     `;
-    for (const row of rows) {
+    for (const row of rows.filter(r => String(r.client_id) === DAILY_AI_BUDGET_CLIENT_ID)) {
       await sql`
         INSERT INTO mcp_spend_log
-          (client_id, token_name, operation, spend_cents, provider, model)
+          (client_id, token_name, operation, spend_cents, provider, model, created_at)
         VALUES
           (${String(row.client_id)}, ${null}, 'expired_reservation',
-           ${Number(row.estimated_cents)}, ${String(row.provider)}, ${String(row.model)})
+           ${Number(row.estimated_cents)}, ${String(row.provider)}, ${String(row.model)}, ${timestampSqlValue(row.created_at)})
       `;
     }
     return rows.length;

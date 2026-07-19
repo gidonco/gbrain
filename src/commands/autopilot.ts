@@ -27,17 +27,10 @@ import { loadConfig, saveConfig, gbrainPath as gbrainHomePath } from '../core/co
 import { ChildWorkerSupervisor } from '../core/minions/child-worker-supervisor.ts';
 import { VERSION } from '../version.ts';
 import {
-  canSelfUpdate,
-  decideSelfUpgrade,
-  isCacheFresh,
-  readUpdateCache,
   reconcileBreadcrumb,
   resolveSelfUpgradeMode,
 } from '../core/self-upgrade.ts';
 import { logSelfUpgrade } from '../core/audit/self-upgrade-audit.ts';
-import { detectInstallMethod } from './upgrade.ts';
-import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
-import { inspectLock } from '../core/db-lock.ts';
 
 /**
  * v0.37.7.0 #1162 — classify autopilot reconnect-loop errors.
@@ -197,141 +190,27 @@ function reconcileSelfUpgradeAtBoot(): void {
   }
 }
 
-/** Conservative idle: no cycle running AND (Postgres) no active/waiting jobs.
- * Any ambiguity / error → NOT idle (we'd rather skip an upgrade window). */
-async function computeAutopilotIdle(engine: BrainEngine, engineType: string): Promise<boolean> {
-  try {
-    const cycle = await inspectLock(engine, 'gbrain-cycle');
-    if (cycle) return false; // a cycle (sync/extract/embed/...) is running
-    if (engineType === 'postgres') {
-      const rows = await (engine as any).executeRaw?.(
-        `SELECT count(*)::int AS n FROM minion_jobs WHERE status IN ('active','waiting')`,
-      );
-      const busy = Number((rows as Array<{ n: number }>)?.[0]?.n ?? 0);
-      return busy === 0;
-    }
-    return true; // pglite: no separate worker queue; cycle-lock-free is the signal
-  } catch {
-    return false;
-  }
-}
-
 /**
- * The autopilot silent self-upgrade channel. Opt-in (`self_upgrade.mode=auto`).
- * Fires only when behind + idle + in quiet hours + the install can self-update
- * and the target isn't known-bad. On apply: write the breadcrumb, run
- * `gbrain upgrade --swap-only` (fast; defers post-upgrade to the relaunch),
- * then unlink the autopilot lock and exit(0) so the supervisor relaunches the
- * new binary (no in-process re-exec — Bun has no execve). Never throws.
+ * Cost-safety policy: generated supervisors deliberately fail stopped, so
+ * autopilot cannot exit cleanly expecting launchd/systemd to relaunch it.
+ * Upgrades remain an explicit operator action (`gbrain upgrade`).
  */
+let selfUpgradePolicyLogged = false;
 async function attemptAutopilotSelfUpgrade(
-  engine: BrainEngine,
-  engineType: string,
-  lockPath: string,
+  _engine: BrainEngine,
+  _engineType: string,
+  _lockPath: string,
 ): Promise<void> {
   try {
     const cfg = loadConfig();
     if (!cfg) return;
     if (resolveSelfUpgradeMode(cfg) !== 'auto') return;
-
-    // latestVersion from the shared cache; refresh when stale (TTL throttles fetch).
-    let entry = readUpdateCache();
-    if (!entry || !isCacheFresh(entry, Date.now())) {
-      try {
-        const { refreshUpdateCache } = await import('./check-update.ts');
-        await refreshUpdateCache();
-        entry = readUpdateCache();
-      } catch {
-        /* fail-open */
-      }
+    if (!selfUpgradePolicyLogged) {
+      selfUpgradePolicyLogged = true;
+      console.warn('[autopilot] self-upgrade disabled under fail-stop supervisor policy; run `gbrain upgrade` explicitly.');
     }
-    if (!entry || entry.marker.kind !== 'upgrade_available' || !entry.marker.latest) return;
-    const latestVersion = entry.marker.latest;
-
-    const idle = await computeAutopilotIdle(engine, engineType);
-    const qh = cfg.self_upgrade?.quiet_hours;
-    const tz = qh?.tz || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-    const verdict = evaluateQuietHours({ start: qh?.start ?? 23, end: qh?.end ?? 8, tz }, new Date());
-    const installMethod = detectInstallMethod();
-
-    const decision = decideSelfUpgrade({
-      mode: 'auto',
-      channel: 'autopilot',
-      currentVersion: VERSION,
-      latestVersion,
-      failedVersions: cfg.self_upgrade?.failed_versions ?? [],
-      idle,
-      inQuietHours: verdict !== 'allow',
-      canSelfUpdate: canSelfUpdate(installMethod),
-      throttledByInterval: false, // cache TTL is the fetch throttle
-    });
-
-    if (decision.action !== 'apply') {
-      if (['unsupported_install', 'known_bad'].includes(decision.action)) {
-        logSelfUpgrade({
-          channel: 'autopilot',
-          action: decision.action,
-          current: VERSION,
-          latest: latestVersion,
-          outcome: 'skipped',
-          reason: decision.reason,
-        });
-      }
-      return;
-    }
-
-    // Apply. Breadcrumb first so a crash-on-launch is attributable.
-    cfg.self_upgrade = { ...(cfg.self_upgrade ?? {}), attempting_version: latestVersion };
-    saveConfig(cfg);
-    logSelfUpgrade({ channel: 'autopilot', action: 'apply', current: VERSION, latest: latestVersion, reason: decision.reason });
-    console.log(`[autopilot] self-upgrade: applying ${VERSION} -> ${latestVersion} (idle, quiet hours).`);
-
-    try {
-      execSync('gbrain upgrade --swap-only', {
-        stdio: 'inherit',
-        timeout: 300_000,
-        env: { ...process.env, GBRAIN_SKIP_STARTUP_HOOKS: '1' },
-      });
-    } catch (e) {
-      const fresh = loadConfig();
-      if (fresh) {
-        const failed = new Set(fresh.self_upgrade?.failed_versions ?? []);
-        failed.add(latestVersion);
-        fresh.self_upgrade = { ...(fresh.self_upgrade ?? {}), failed_versions: [...failed] };
-        delete fresh.self_upgrade.attempting_version;
-        saveConfig(fresh);
-      }
-      logSelfUpgrade({
-        channel: 'autopilot',
-        action: 'apply',
-        current: VERSION,
-        latest: latestVersion,
-        outcome: 'failed',
-        error: e instanceof Error ? e.message : String(e),
-      });
-      console.error(`[autopilot] self-upgrade swap failed; staying on ${VERSION}.`);
-      return;
-    }
-
-    // Swap done + smoke-verified by `upgrade --swap-only`. Exit cleanly so the
-    // supervisor relaunches the NEW binary, which reconciles the breadcrumb.
-    logSelfUpgrade({
-      channel: 'autopilot',
-      action: 'apply',
-      current: VERSION,
-      latest: latestVersion,
-      outcome: 'applied',
-      reason: 'swapped; exiting for supervisor relaunch',
-    });
-    console.log('[autopilot] self-upgrade swapped; exiting for relaunch.');
-    try {
-      unlinkSync(lockPath);
-    } catch {
-      /* already gone */
-    }
-    process.exit(0);
   } catch {
-    /* the self-upgrade channel must never break the tick */
+    /* policy reporting must never break the tick */
   }
 }
 
@@ -364,7 +243,9 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
 
   const repoPath = parseArg(args, '--repo') || await engine.getConfig('sync.repo_path');
   const baseInterval = parseInt(parseArg(args, '--interval') || '300', 10);
-  const minimumInterval = parseInt(parseArg(args, '--min-interval') || String(baseInterval), 10);
+  // Preserve the historical adaptive cadence unless an operator explicitly
+  // supplies a floor. Generated installs always supply the 7,200s floor.
+  const minimumInterval = parseInt(parseArg(args, '--min-interval') || '60', 10);
   const jsonMode = args.includes('--json');
   const forceInline = args.includes('--inline');
   const noWorker = !shouldSpawnAutopilotWorker(args);
@@ -1017,7 +898,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
     }
 
     // 4. Health check + adaptive interval (same for both paths)
-    let interval = baseInterval;
+    let interval = resolveAutopilotInterval(baseInterval, 50, minimumInterval);
     try {
       const health = await engine.getHealth();
       const score = (health as any).brain_score ?? 50;
@@ -1084,8 +965,12 @@ export function resolveAutopilotInterval(
   brainScore: number,
   minimumSeconds: number,
 ): number {
-  const safeBase = Math.max(60, Math.floor(baseSeconds));
-  const safeMinimum = Math.max(60, Math.floor(minimumSeconds));
+  const safeBase = Number.isFinite(baseSeconds) && baseSeconds > 0
+    ? Math.max(60, Math.floor(baseSeconds))
+    : 300;
+  const safeMinimum = Number.isFinite(minimumSeconds) && minimumSeconds > 0
+    ? Math.max(60, Math.floor(minimumSeconds))
+    : safeBase;
   const adaptive = brainScore >= 90
     ? safeBase * 2
     : brainScore < 70
