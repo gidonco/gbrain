@@ -1,22 +1,21 @@
 # Frontmatter scan: DB-backed incremental state (Phase 2 design sketch)
 
-**Status:** Designed, not built. Captured here as the starting point for the
-follow-up PR after v0.38.2.0.
+**Status:** Designed, not built.
 
 ## Why this exists
 
-v0.38.2.0 fixed the load-bearing bug class that caused `gbrain doctor` to
-hang on large brains: the disk walker descended into `node_modules/`, `.git/`,
-and other vendor trees on every tick. After that fix doctor completes in
-seconds on most brains, and bounded wall-clock (default 30s, with honest
-partial-state surfacing) on any brain.
+Doctor's `frontmatter_integrity` check walks the brain on disk. The walker
+skips `node_modules/`, `.git/`, and other vendor trees (`pruneDir` inside
+`src/core/brain-writer.ts:walkDir`, driven by `scanBrainSources`)
+and runs under a bounded wall-clock (default 30s, `GBRAIN_DOCTOR_FM_TIMEOUT_MS`)
+with honest partial-state surfacing when the deadline fires, so doctor
+completes in seconds on most brains and in bounded time on any brain.
 
-But the steady-state cost of `frontmatter_integrity` is still O(N) in real
+But the steady-state cost of `frontmatter_integrity` is O(N) in real
 syncable pages: every doctor tick re-walks the filesystem and re-parses
 every `.md` file. For users with 200K+ pages the steady-state cost is in
-the seconds even after Fix 1. For sub-second steady-state doctor (the
-right shape for cron-monitored health checks), the scan needs to become
-incremental.
+the seconds. For sub-second steady-state doctor (the right shape for
+cron-monitored health checks), the scan needs to become incremental.
 
 This document captures the Phase 2 design before the follow-up PR starts,
 so the implementer doesn't have to re-derive it.
@@ -25,7 +24,7 @@ so the implementer doesn't have to re-derive it.
 
 Doctor's `frontmatter_integrity` check completes in O(1) SQL queries
 regardless of brain size, with the same per-source breakdown and partial-
-state semantics as v0.38.2.0's bounded-walk approach. Incremental refresh
+state semantics as the bounded-walk approach. Incremental refresh
 runs as a sync-side write + an autopilot cycle phase, so the steady-state
 work is amortized across the workflow that already touches each file.
 
@@ -68,11 +67,13 @@ existing.
 ## Migration shape
 
 ```ts
-// src/core/migrate.ts — append after the v80 entry
+// src/core/migrate.ts — append after the CURRENT last entry in the
+// MIGRATIONS array (take the next unused version number at implementation
+// time; the numbers below are placeholders, not a reserved slot)
 const migrations = [
-  // ...existing v1-v80...
+  // ...existing entries...
   {
-    version: 81,
+    version: NEXT_VERSION, // next unused number in the MIGRATIONS array
     name: 'frontmatter_scan_state',
     sql: `
       CREATE TABLE IF NOT EXISTS frontmatter_scan_state (...);
@@ -120,8 +121,8 @@ const rows = await engine.executeRaw<{ source_id: string; issues: number }>(
 );
 ```
 
-One SQL query, constant time regardless of brain size. The partial-state
-surfacing from v0.38.2.0 stays — when `frontmatter_scan_state` is stale
+One SQL query, constant time regardless of brain size. The bounded walk's
+partial-state surfacing stays — when `frontmatter_scan_state` is stale
 (no rows for a registered source, or `last_scanned_at` >24h old for any
 source), doctor warns about freshness rather than reporting potentially-
 stale data as authoritative.
@@ -162,7 +163,7 @@ stale data as authoritative.
 
 ## What this design deliberately does NOT do
 
-- **Replace v0.38.2.0's bounded-walk safety net.** Phase 2 makes the
+- **Replace the bounded-walk safety net.** Phase 2 makes the
   steady-state cheap, but the disk walker (with its deadline check) stays
   as the source-of-truth fallback for sources whose scan state is missing
   or stale. Belt-and-suspenders.
@@ -180,13 +181,13 @@ stale data as authoritative.
    leading `./`, etc.). The incremental scanner needs to match what sync
    stores so UPSERTs key correctly. Audit before writing.
 2. **Soft-delete interaction.** A page that gets soft-deleted in the DB
-   (v0.26.5) still has a file on disk. Should the incremental scan
+   still has a file on disk. Should the incremental scan
    continue to track its frontmatter state? Probably yes (so a future
    `restore_page` doesn't surprise with stale frontmatter), but worth
    confirming with the soft-delete owner.
 3. **Two-phase rollout.** Land the table + writes first, let it backfill
    for a release cycle, then switch the doctor reader. Avoids the
-   "Phase 2 ships but the table is empty" case where doctor regresses to
+   "Phase 2 ships but the table is empty" case where doctor falls back to
    reporting "no scan state."
 
 ## TODO file entry
@@ -194,7 +195,7 @@ stale data as authoritative.
 ```
 - [ ] Implement Phase 2: DB-backed frontmatter scan state.
       Design lives at docs/architecture/frontmatter-scan-incremental.md.
-      Schema migration v81 + sync-side UPSERT + incremental scan command
+      New schema migration + sync-side UPSERT + incremental scan command
       + autopilot cycle phase + doctor reader. Two-phase rollout: ship
       table + writes first; flip the reader one release later.
 ```

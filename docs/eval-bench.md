@@ -8,11 +8,19 @@ For the **NDJSON wire format** consumed by gbrain-evals, see
 [`eval-capture.md`](./eval-capture.md). This doc is the human dev loop
 that lives on top of that format.
 
-## v0.41 update — the LOOP is now real
+If you're touching **memory behavior** rather than retrieval ranking — the
+Retrieval Reflex push path, conversation→facts write-back, cross-session
+continuity, source isolation — the gate for that layer is **BrainBench**
+(`gbrain eval brainbench`): see [`eval/BRAINBENCH.md`](./eval/BRAINBENCH.md).
+The two stack: this doc's capture→baseline→replay loop gates query-level
+result sets; BrainBench gates the memory behaviors above them, with its own
+committed baseline (`evals/brainbench/baselines/main.json`) compared against
+MAIN's copy in CI so a PR can't self-approve a regression.
 
-Before v0.41, you could capture eval rows and replay them but nothing
-stitched them into a gate. `gbrain bench publish` + `gbrain eval gate`
-close the loop. Two gates:
+## The eval gate loop
+
+`gbrain bench publish` + `gbrain eval gate` stitch captured eval rows into
+a pass/fail gate. Two gates:
 
 - **Regression gate** (`--baseline X.baseline.ndjson`): replays a baseline
   you captured against your current brain. Catches: "did my refactor break
@@ -39,7 +47,7 @@ gbrain bench publish --from /tmp/captured.ndjson --to ~/.gbrain/baselines/person
 gbrain eval gate --baseline ~/.gbrain/baselines/personal.baseline.ndjson
 ```
 
-### Privacy posture (D9)
+### Privacy posture
 
 **Public baselines in `gbrain-evals` are hermetic-synthetic ONLY.** Real
 user captures stay local in `~/.gbrain/baselines/`. The boundary is
@@ -55,6 +63,24 @@ from a real user's `eval_candidates` table.
 CI. Production retrieval differs via the query cache, salience freshness,
 expansion, etc. The gate measures retrieval quality with a fixed pipeline;
 your users may see different results when the cache is warm.
+
+For a fully hermetic run (CI canaries, keyless environments), add
+`--embedder deterministic` to the correctness gate: query embeddings come
+from the qrels fixture's basis-vector dims (`src/eval/deterministic-embed.ts`)
+instead of the gateway, so the gate runs with no API keys and no network.
+Correctness-gate-only — it is rejected together with `--baseline` (replay
+re-embeds captured queries via the gateway) and requires `--qrels`. Bare
+`hybridSearch` never reads or writes the semantic query cache, so a
+deterministic run cannot poison cached production results. This is what the
+hermetic retrieval canary (`scripts/run-eval-canary.ts`) runs: a throwaway
+PGLite brain seeded from the qrels fixture, gating the hybrid ranking
+pipeline (keyword/title/alias arms + RRF) with synthetic vectors. In CI the
+canary runs via `test/eval-canary.test.ts` in the unit matrix; `bun run
+check:eval-canary` is the on-demand package script (it is deliberately not
+in the `verify` battery — the unit-matrix twin already gates it). Honest
+scope: semantic-embedding regressions remain the keyed eval suites' job.
+Reproduce locally with `bun run scripts/run-eval-canary.ts` (`--record`
+appends to the `.gbrain-evals/eval-results.jsonl` ledger).
 
 ### `.qrels.json` shape
 
@@ -131,14 +157,9 @@ gbrain query "anything" >/dev/null
 psql $DATABASE_URL -c 'SELECT count(*) FROM eval_candidates'   # should be > 0
 ```
 
-To override (force on/off regardless of env var), edit `~/.gbrain/config.json`:
-
-```json
-{"eval": {"capture": true}}    // force on
-{"eval": {"capture": false}}   // force off
-```
-
-Explicit config beats the env var both directions.
+The full on/off resolution order (config beats env var, both directions) is
+documented once in [`eval-capture.md`](./eval-capture.md) — that file is the
+capture contract.
 
 ## The 4-command loop
 
@@ -199,13 +220,13 @@ Three numbers tell you whether the change is safe to land:
 
 It does NOT compute MRR or nDCG — those need ground-truth relevance labels,
 not a baseline comparison. For metric-against-truth eval, use
-`gbrain eval --qrels <path>` (the legacy IR-eval path, still supported). The
+`gbrain eval gate --qrels <path>` (the correctness gate above). The
 replay tool answers a different question: "did my code change move
 retrieval, and which queries did it move most?"
 
 For a third evaluation axis — public benchmark, ground-truth labels, full
 question-answer pipeline (not just retrieval) — `gbrain eval longmemeval
-<dataset.jsonl>` (v0.28.8) runs the LongMemEval benchmark against gbrain's
+<dataset.jsonl>` runs the LongMemEval benchmark against gbrain's
 hybrid retrieval. Each question gets a clean in-memory PGLite, its haystack
 imported, the question asked, the hypothesis emitted as JSONL — exactly the
 shape LongMemEval's `evaluate_qa.py` consumes. Your `~/.gbrain` brain is
@@ -283,11 +304,11 @@ Before merging anything that touches:
 
 - `src/core/search/hybrid.ts` (RRF, fusion, dedup, two-pass retrieval)
 - `src/core/search/source-boost.ts` / `sql-ranking.ts` (per-source ranking)
-- `src/core/search/intent.ts` (auto-detail classification)
+- `src/core/search/query-intent.ts` (auto-detail classification)
 - `src/core/search/expansion.ts` (Haiku query expansion)
 - `src/core/search/dedup.ts` (cross-page result collapse)
 - `src/core/embedding.ts` or any embedding model swap
-- `src/core/operations.ts` `query` or `search` op handlers (capture surface)
+- `src/core/ops/search.ts` `query` or `search` op handlers (capture surface)
 - `src/core/postgres-engine.ts` / `pglite-engine.ts` `searchKeyword` /
   `searchVector` SQL
 
@@ -307,7 +328,7 @@ week before merging), you can hand-author an NDJSON file:
 Then run `gbrain eval replay --against handcrafted.ndjson` to confirm the
 authoritative slugs come back. This is the seam between the BrainBench-Real
 pipeline (replay against live captures) and the BrainBench fixed-fixture
-pipeline (`gbrain eval --qrels` with the sibling
+pipeline (`gbrain eval gate --qrels` with the sibling
 [gbrain-evals](https://github.com/garrytan/gbrain-evals) corpus).
 
 ## Off-switch
@@ -337,26 +358,144 @@ Existing `eval_candidates` rows stay until you `gbrain eval prune
 | `rows_errored > 0` | One or more queries threw. Inspect first 3 in human output, or `--json` to see all `error_message` fields |
 | Many `skipped: empty query` | Capture ran on rows where someone passed empty `query` — check why those were captured |
 
-## Public benchmarks: LongMemEval (v0.28.8)
+## Public benchmarks: LongMemEval
 
-`gbrain eval longmemeval` runs the public [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval)
+`gbrain eval longmemeval` runs the public [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned)
 benchmark directly against gbrain's hybrid retrieval. Different evaluation
 axis from `eval replay`: public dataset with ground-truth labels, end-to-end
 question-answer pipeline, hermetic per-question brains.
 
-```bash
-# Download the dataset (visit the HF page in a browser; gated/manual download).
-# Place longmemeval_oracle.json (or _s.json) somewhere local.
+**Say to your agent:** *"Run the public LongMemEval benchmark against my
+gbrain retrieval"* (no skill backs this; your agent runs
+`gbrain eval longmemeval <dataset> --retrieval-only --top-k 5 --by-type --no-trajectory`,
+a self-check at the default settings. The receipted strict number below comes
+from the gbrain-evals runner, which pins reranker and autocut off; see
+"Download and run").
 
-# Retrieval-only (no LLM answer-gen, fastest path, no Anthropic key needed):
-gbrain eval longmemeval ./longmemeval_oracle.json --limit 50 --retrieval-only \
-  > /tmp/hypothesis.jsonl
+### Current measured result
+
+**93.19% session-level `recall_all@5` (438/470), reranker off**: the
+like-for-like row for comparison against other systems, on LongMemEval's
+official retrieval metric. A question counts only when EVERY gold session
+appears among the top-5 distinct retrieved sessions. Retrieval only, no
+reader model. Any-hit `recall_any@5` (at least one gold session in the top 5)
+is 98.72% and is a diagnostic, not the headline; nDCG_any@5 is 93.32%.
+
+With the default reranker `voyage:rerank-2.5` on (the default path, what
+`balanced` and `tokenmax` run), **95.32% `recall_all@5` (448/470)**; any-hit
+99.79%, diagnostic. Same run, same 470 scored questions.
+
+- **Dataset:** `longmemeval_s`, the cleaned September 2025 revision of the S
+  split (`xiaowu0162/longmemeval-cleaned`). 500 questions; the 30 abstention
+  (`_abs`) questions are excluded from the recall denominator, as the
+  official `print_retrieval_metrics.py` does, so 470 are scored. The ceiling
+  at k=5 is 99.4%: 3 questions carry 6 gold sessions and cannot fit in a
+  top-5 list.
+- **Measured:** 2026-09-02 at gbrain v0.48.2.0 (commit `172df271`), single
+  run, k=5, search mode `balanced`, autocut off, reranker off except the two
+  rerank arms (`voyage:rerank-2.5`), embedder
+  `openai:text-embedding-3-large` at 1536 dimensions. Harness: the
+  gbrain-evals runner (`main` at `29e9ac9`, pinned to that gbrain commit);
+  the official metric is recomputed from the per-question rows by
+  `eval/runner/longmemeval-aggregate.ts`. p50 3.7 s / p99 6.3 s per question,
+  0 errors. Distinct sessions in the top 5: 5 on 422 questions, 4 on 47, 3 on
+  1 (mean 4.90).
+
+All five arms come from that same run (470 scored, k=5, 0 errors in every
+arm). "Paired vs hybrid" is per-question against the hybrid
+row: questions this arm gets right that hybrid missed / questions it loses
+that hybrid had. Latency is per question.
+
+| Arm | `recall_all@5` | `recall_any@5` | nDCG_any@5 | Mean distinct sessions in top 5 | Paired vs hybrid | p50 / p99 |
+|---|---|---|---|---|---|---|
+| hybrid (reranker off; like-for-like row) | **93.19%** (438/470) | 98.72% | 93.32% | 4.90 | +0 / -0 | 3.7 s / 6.3 s |
+| hybrid + LLM multi-query expansion (`--expansion`, what `tokenmax` runs) | **54.89%** (258/470) | 86.60% | 71.68% | 5.00 | +3 / -183 | 5.1 s / 8.0 s |
+| hybrid-sessdiv (over-fetch 3x, keep top-5 distinct sessions) | **93.40%** (439/470) | 98.72% | 93.38% | 5.00 | +1 / -0 | 3.7 s / 6.4 s |
+| hybrid + rerank (`voyage:rerank-2.5`, the default path) | **95.32%** (448/470) | 99.79% | 95.77% | 4.89 | +18 / -8 | 3.8 s / 6.3 s |
+| hybrid-sessdiv + rerank | **95.53%** (449/470) | 99.79% | 95.82% | 5.00 | +19 / -8 | 3.8 s / 6.3 s |
+
+`recall_all@5` by question type, same run, same five arms:
+
+| Question type | n | hybrid | hybrid + expansion | hybrid-sessdiv | hybrid + rerank | hybrid-sessdiv + rerank |
+|---|---|---|---|---|---|---|
+| knowledge-update | 72 | 98.6% (71) | 62.5% (45) | 98.6% (71) | 100.0% (72) | 100.0% (72) |
+| multi-session | 121 | 92.6% (112) | 34.7% (42) | 92.6% (112) | 92.6% (112) | 92.6% (112) |
+| single-session-assistant | 56 | 100.0% (56) | 82.1% (46) | 100.0% (56) | 100.0% (56) | 100.0% (56) |
+| single-session-preference | 30 | 96.7% (29) | 80.0% (24) | 96.7% (29) | 100.0% (30) | 100.0% (30) |
+| single-session-user | 64 | 98.4% (63) | 78.1% (50) | 98.4% (63) | 100.0% (64) | 100.0% (64) |
+| temporal-reasoning | 127 | 84.3% (107) | 40.2% (51) | 85.0% (108) | 89.8% (114) | 90.6% (115) |
+| **all scored** | **470** | **93.19% (438)** | **54.89% (258)** | **93.40% (439)** | **95.32% (448)** | **95.53% (449)** |
+
+What the arms say:
+
+- **The reranker is worth +2.13 points on the default path** (93.19%
+  to 95.32%, +18 / -8 paired). Every gain is outside multi-session, which the
+  reranker leaves at 112/121 both ways; the largest is temporal-reasoning
+  (107 to 114 of 127). Any-hit climbs to 99.79%, so the reranker is promoting
+  sessions already in the candidate pool rather than recalling new ones.
+- **LLM multi-query expansion is harmful at k=5.** 54.89% against 93.19%,
+  +3 / -183 paired, worse in every question type, zero expansion errors.
+  `tokenmax` users get this path; the fix (weight variant lists below the
+  original in RRF, cap their contribution, or expand only when the original's
+  evidence is weak) is the TODOS.md entry "multi-query expansion dilutes
+  small-k retrieval now that fusion is clean". `tokenmax` was not measured
+  with the reranker in this run.
+- **Slot starvation is not the miss class.** Session-diverse over-fetch
+  fills every top-5 to 5.00 distinct sessions (plain hybrid returned fewer
+  than 5 on 48 of 470 questions) and adds exactly one question, with or
+  without the reranker (+1 / -0 and 95.32% to 95.53%). The remaining misses
+  are ranking misses, not duplicate sessions eating top-5 slots.
+
+How to read other systems' numbers. On the strict metric on this dataset we
+found no published score above 93.19%. The closest strict comparisons are
+our own recomputations from MemPalace's committed rankings (85.7% raw,
+90.0% with an LLM reranker; MemPalace publishes only any-hit, 96.6% and
+98.4%) and ContextFit's self-reported 87.45% All@5 (its rerank layer reads
+gold labels, so loosely comparable). The 90-96% figures from Mem0, Mastra,
+MemCog, Zep, Hindsight, ByteRover and Supermemory are LLM-judged answer
+accuracy, a different quantity that moves with the reader and judge model;
+gbrain has published no answer-accuracy run on LongMemEval. Full report,
+comparison table, and receipts:
+[gbrain-evals `docs/benchmarks/2026-05-07-longmemeval-s.md`](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-05-07-longmemeval-s.md).
+
+### Download and run
+
+```bash
+# Download the cleaned (September 2025) revision of the S split. The HF
+# dataset may ask you to accept its terms in a browser first.
+mkdir -p ~/datasets/longmemeval
+curl -Lo ~/datasets/longmemeval/longmemeval_s_cleaned.json \
+  https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+
+# The embedder is not a per-run flag: it resolves from the `embedding_model`
+# config key (`<provider>:<model>`; new-install default `voyage:voyage-4`,
+# existing brains keep their configured model) or the
+# GBRAIN_EMBEDDING_MODEL / GBRAIN_EMBEDDING_DIMENSIONS env overrides. The
+# measured result above used openai:text-embedding-3-large at 1536 dims.
+export GBRAIN_EMBEDDING_MODEL=openai:text-embedding-3-large
+export GBRAIN_EMBEDDING_DIMENSIONS=1536
+
+# Self-check, retrieval-only at the published cutoff (no LLM answer-gen;
+# --no-trajectory skips the per-session Haiku claim-extractor call, so no
+# chat key is needed):
+gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json \
+  --retrieval-only --top-k 5 --by-type --no-trajectory \
+  --output /tmp/lme-hybrid.jsonl
+# Two caveats make this a self-check, not a like-for-like reproduction. The
+# in-repo `--by-type` summary reports ANY-HIT recall only, and the command
+# runs the defaults: the `balanced` bundle turns the reranker and
+# autocut on whenever VOYAGE_API_KEY is set, and the CLI has no switch to pin
+# them off (the benchmark brain is isolated, so `gbrain config set` does not
+# reach it). The receipted 93.19% recall_all@5 comes from the gbrain-evals
+# runner, which pins reranker and autocut off and emits scorable per-question
+# rows (470 scored, the 30 `_abs` questions dropped):
+#   bash eval/runner/longmemeval-batch.sh --adapters hybrid --embedding-model openai:text-embedding-3-large --embedding-dims 1536
 
 # Full pipeline (Anthropic key required for answer-gen):
-gbrain eval longmemeval ./longmemeval_oracle.json --limit 50 \
+gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json --limit 50 \
   > /tmp/hypothesis.jsonl
 
-# Score with LongMemEval's published evaluate_qa.py (not bundled — needs
+# Score with LongMemEval's published evaluate_qa.py (not bundled; needs
 # OpenAI gpt-4o per their spec):
 python evaluate_qa.py /tmp/hypothesis.jsonl
 ```
@@ -387,9 +526,14 @@ python evaluate_qa.py /tmp/hypothesis.jsonl
 | `--retrieval-only` | off | Emit retrieved chunks; no LLM answer-gen |
 | `--keyword-only` | off | Disable vector path (debug retrieval issues) |
 | `--expansion` | **off** | Multi-query expansion. Off by default for determinism (no per-query Haiku call). Pass to opt in. |
-| `--top-k K` | 10 | Retrieval depth |
+| `--top-k K` | 8 | Retrieval depth (the published result uses `--top-k 5`) |
+| `--mode M` | config | Search mode `conservative`, `balanced`, or `tokenmax`, resolved through `src/core/search/mode.ts`; `tokenmax` implies `--expansion` |
 | `--model M` | resolved | Default resolves through `resolveModel()` 6-tier chain (`models.eval.longmemeval` config key) |
 | `--output FILE` | stdout | Write hypothesis JSONL to file instead of stdout |
+| `--resume-from FILE` | off | Skip `question_id`s already present in FILE (usually the same path as `--output`, which then appends) |
+| `--no-trajectory` | off | Skip the trajectory claim extractor and per-question intent routing (A/B baseline) |
+| `--by-type` | off | Append a `by_type_summary` JSON line with per-question-type any-hit R@k |
+| `--by-type-floor F` | off | Exit non-zero if any question type's rate is below F in [0, 1]; implies `--by-type` |
 
 ### Numbers
 
@@ -398,7 +542,7 @@ p50 25.9ms / p99 30.3ms warm reset+import+search on Apple Silicon (per the
 500ms speed gate. 500 questions = ~13s of overhead plus your retrieval and
 LLM latency.
 
-## Measuring brain consistency over time (v0.32.6)
+## Measuring brain consistency over time
 
 `gbrain eval suspected-contradictions` is a complementary measurement
 instrument: it samples retrieval results for unmarked semantic
@@ -432,23 +576,21 @@ commands per high-severity finding.
 ### See also
 
 - `docs/contradictions.md` — architecture, severity rubric, action criteria.
-- CHANGELOG `## [0.32.6]` — full release notes including the bigger-swing
-  decision criteria gated on Wilson CI lower-bound.
+- `CHANGELOG.md` — release history.
 
-## v0.40.1.0 Track D — Eval infrastructure
+## Eval infrastructure: by-type breakdowns, the hermetic gate, batch scoring
 
-Three eval surfaces grew non-trivial capabilities in v0.40.1.0. This section
-covers the dev loop that uses them and the gates they enforce.
+Three further eval surfaces, and the dev loop that uses them.
 
 ### `gbrain eval longmemeval --by-type` — per-question-type R@k breakdown
 
-LongMemEval has always computed per-question-type recall internally; v0.40.1.0
-surfaces it in machine-readable form. Two additive changes:
+LongMemEval computes per-question-type recall internally, and surfaces it in
+machine-readable form:
 
-1. Every per-question JSONL row now includes a `question: string` field so the
+1. Every per-question JSONL row includes a `question: string` field so the
    `gbrain eval cross-modal --batch` consumer (below) can read it without
    joining back against the source dataset.
-2. New `--by-type` flag emits a final aggregate line keyed by `question_type`:
+2. The `--by-type` flag emits a final aggregate line keyed by `question_type`:
 
 ```json
 {"schema_version": 1, "kind": "by_type_summary",
@@ -480,11 +622,11 @@ echo "exit=$?"  # 1 if any type fell below 0.80
 
 ### Hermetic retrieval gate — `test/eval-replay-gate.test.ts`
 
-The v0.40.1.0 Track D structural fix for "PRs touching `src/core/search/`
-silently regress retrieval." Replaces the original "replay against captured
-eval_candidates" design (which Codex caught as non-functional in CI — see
-the `v0.41+: contributor-mode CI capture` TODO in `TODOS.md` for the deferred
-real-query version).
+Guards against PRs touching `src/core/search/` silently regressing
+retrieval. A "replay against captured eval_candidates" design can't work in
+CI (CI has no captured production queries), so the gate is hermetic; see the
+`contributor-mode CI capture` TODO in `TODOS.md` for the deferred
+real-query version.
 
 How it works:
 - Hand-curated qrels fixture at `test/fixtures/eval-baselines/qrels-search.json`
@@ -499,7 +641,7 @@ How it works:
 - Lives in the unit-shard test matrix (`.github/workflows/test.yml`) so it
   runs on every PR via `bun test`, NOT in the E2E fixed-file workflow.
 
-#### Refreshing the qrels fixture (the `Why:` discipline, D4)
+#### Refreshing the qrels fixture (the `Why:` discipline)
 
 When CI fails because a legitimate ranking change moved expected slugs, the
 fix is to edit `qrels-search.json` directly. **Always include a `Why:` line
@@ -512,9 +654,8 @@ Example commit body:
 ```
 chore(eval): refresh qrels for new source-boost ordering
 
-Why: v0.40.x source-boost now weights originals/ over concepts/, so
-q12 (founder-mode) now correctly surfaces originals/founder-mode-example
-top-1. Manual verification: ran the production query; new ranking is
+Why: source-boost weights originals/ over concepts/, so q12
+(founder-mode) correctly surfaces originals/founder-mode-example top-1. Manual verification: ran the production query; new ranking is
 clearly better-aligned with the query intent.
 ```
 
@@ -571,9 +712,10 @@ gbrain config set autopilot.nightly_quality_probe.enabled true
 gbrain config set autopilot.nightly_quality_probe.max_usd 5.00   # optional override
 ```
 
-Note: `--phase nightly_quality_probe` wiring into the autopilot scheduler is
-deferred to a v0.41+ follow-up (see TODOS.md). For now the phase is callable
-in isolation; the test harness exercises it via DI stubs.
+The autopilot scheduler invokes the probe on its tick cadence when the
+config gate is on (`src/commands/autopilot.ts`, pinned by
+`test/autopilot-nightly-probe-wiring.test.ts`); the phase also stays
+callable in isolation, and the test harness exercises it via DI stubs.
 
 ```bash
 # Manual smoke (exercises the path via DI stubs, no real API spend).

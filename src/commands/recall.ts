@@ -52,6 +52,7 @@ const KIND_ICON: Record<FactKind, string> = {
   commitment: '🤝',
   belief: '💭',
   fact: '📌',
+  idea: '💡',
 };
 
 interface ParsedFlags {
@@ -66,6 +67,10 @@ interface ParsedFlags {
   json: boolean;
   source: string;
   limit: number;
+  // MEMORY_VERBS v1 [c4]: recall's verb params, routed through the recall OP
+  // (this hand-rolled CLI otherwise ignores unknown flags silently).
+  query: string | null;
+  budgetTokens: number | null;
   // v0.32
   sinceLastRun: boolean;
   pending: boolean;
@@ -94,6 +99,8 @@ function parseFlags(args: string[]): ParsedFlags {
     json: false,
     source: 'default',
     limit: 50,
+    query: null,
+    budgetTokens: null,
     sinceLastRun: false,
     pending: false,
     rollup: false,
@@ -112,6 +119,8 @@ function parseFlags(args: string[]): ParsedFlags {
     if (a === '--json') { out.json = true; continue; }
     if (a === '--source') { out.source = args[++i] ?? 'default'; continue; }
     if (a === '--limit') { out.limit = parseInt(args[++i] ?? '50', 10) || 50; continue; }
+    if (a === '--query') { out.query = args[++i] ?? null; continue; }
+    if (a === '--budget-tokens') { out.budgetTokens = parseInt(args[++i] ?? '', 10) || null; continue; }
     if (a === '--since-last-run') { out.sinceLastRun = true; continue; }
     if (a === '--pending') { out.pending = true; continue; }
     if (a === '--rollup') { out.rollup = true; continue; }
@@ -223,11 +232,98 @@ export async function runRecall(engine: BrainEngine, args: string[]): Promise<vo
 
   const sourceId = await resolveSourceForRecall(engine, flags.source, thinClient);
 
+  // MEMORY_VERBS v1 [c4]: the verb params route through the recall OP so the
+  // CLI and MCP exercise the same arm (query/budget packing/superset envelope).
+  if (flags.query !== null || flags.budgetTokens !== null) {
+    await runRecallVerb(engine, flags, sourceId);
+    return;
+  }
+
   if (flags.watchSeconds !== null) {
     await runWatchLoop(engine, flags, sourceId, thinClient, flags.watchSeconds);
     return;
   }
   await runRecallOnce(engine, flags, sourceId, thinClient, 'briefing');
+}
+
+/**
+ * MEMORY_VERBS v1 — `gbrain recall --query ... [--budget-tokens N]` routes
+ * through the recall OP (same code path MCP exercises) and renders facts +
+ * search results with the budget footer. `--json` prints the raw envelope.
+ */
+async function runRecallVerb(engine: BrainEngine, flags: ParsedFlags, sourceId: string): Promise<void> {
+  const { operationsByName } = await import('../core/operations.ts');
+  const op = operationsByName['recall'];
+  const ctx = {
+    engine,
+    config: loadConfig() || { engine: 'pglite' as const },
+    logger: {
+      info: (m: string) => process.stderr.write(`[info] ${m}\n`),
+      warn: (m: string) => process.stderr.write(`[warn] ${m}\n`),
+      error: (m: string) => process.stderr.write(`[error] ${m}\n`),
+    },
+    dryRun: false,
+    remote: false as const,
+    sourceId,
+  };
+  const result = (await op.handler(ctx, {
+    ...(flags.entity ? { entity: flags.entity } : {}),
+    ...(flags.query ? { query: flags.query } : {}),
+    ...(flags.budgetTokens ? { budget_tokens: flags.budgetTokens } : {}),
+    ...(flags.since ? { since: flags.since.toISOString() } : {}),
+    ...(flags.grep ? { grep: flags.grep } : {}),
+    include_expired: flags.includeExpired,
+    limit: flags.limit,
+  })) as {
+    facts: Array<{ fact_id: string; fact: string; kind: string; entity_slug: string | null; provenance: string }>;
+    results?: Array<{ slug: string; title: string | null; evidence: string; chunk: string | null }>;
+    search_degraded?: string;
+    budget_tokens?: number;
+    budget_used?: number;
+    dropped_count?: number;
+  };
+
+  if (flags.json) {
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    return;
+  }
+  const lines: string[] = [];
+  if (result.facts.length) {
+    lines.push('Facts:');
+    for (const f of result.facts) {
+      lines.push(`  #${f.fact_id} [${f.kind}]${f.entity_slug ? ` (${f.entity_slug})` : ''} ${f.fact} — ${f.provenance}`);
+    }
+  }
+  if (result.results?.length) {
+    lines.push('Pages:');
+    for (const r of result.results) {
+      lines.push(`  ${r.slug} [${r.evidence}] ${r.title ?? ''}`);
+      if (r.chunk) lines.push(`    ${r.chunk.replace(/\s+/g, ' ').slice(0, 160)}`);
+    }
+  }
+  if (!lines.length) lines.push('Nothing recalled.');
+  if (result.search_degraded) lines.push(`note: search degraded (${result.search_degraded})`);
+  if (result.budget_tokens !== undefined) {
+    lines.push(`budget: ${result.budget_used}/${result.budget_tokens} tokens used, ${result.dropped_count} dropped`);
+  }
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+/**
+ * #4720 — shared by the local (fetchRowsLocal) and thin-client entity→text
+ * fallbacks: a bare positional that matched no facts by entity is retried as
+ * a fact-text grep. One gating predicate + one stderr note so the two paths
+ * can't drift. Explicit --grep callers keep exact semantics (their filter
+ * already ran); --supersessions/--session-id keep their own arms.
+ */
+function entityTextFallbackApplies(flags: ParsedFlags, matched: number): boolean {
+  return matched === 0 && !!flags.entity && !flags.grep && !flags.supersessions && !flags.sessionId;
+}
+
+function noteEntityTextFallback(entity: string, matched: number): void {
+  process.stderr.write(
+    `[recall] no facts for entity '${entity}'; matched ${matched} fact(s) by text — use --grep to force text matching.\n`,
+  );
 }
 
 async function runRecallOnce(
@@ -279,6 +375,26 @@ async function runRecallOnce(
     }>(raw);
     rows = unpacked.facts.map(remoteFactToRow);
     pendingCount = unpacked.pending_consolidation_count;
+
+    // #4720: thin-client mirror of the local entity→text fallback (see
+    // fetchRowsLocal). A bare positional that matched no facts by entity is
+    // retried as a fact-text grep so a literal word from fact text still
+    // recalls over the wire.
+    if (entityTextFallbackApplies(flags, rows.length)) {
+      const fbParams: Record<string, unknown> = { ...params, grep: flags.entity!.toLowerCase() };
+      delete fbParams.entity;
+      const fbRaw = await callRemoteTool(cfg!, 'recall', fbParams, { timeoutMs: 30_000 });
+      const fb = unpackToolResult<{
+        facts: Array<Record<string, unknown>>;
+        total: number;
+        pending_consolidation_count?: number;
+      }>(fbRaw);
+      if (fb.facts.length > 0) {
+        noteEntityTextFallback(flags.entity!, fb.facts.length);
+        rows = fb.facts.map(remoteFactToRow);
+        pendingCount = fb.pending_consolidation_count ?? pendingCount;
+      }
+    }
   } else {
     rows = await fetchRowsLocal(engine, flags, sourceId, resolvedSince);
     if (flags.pending) {
@@ -336,26 +452,65 @@ async function fetchRowsLocal(
   }
   if (flags.entity) {
     const slug = (await resolveEntitySlug(engine, sourceId, flags.entity)) ?? flags.entity;
-    return engine.listFactsByEntity(sourceId, slug, {
+    const rows = await engine.listFactsByEntity(sourceId, slug, {
       activeOnly: !flags.includeExpired,
       limit: flags.limit,
+      excludeAuditRows: true,
     });
+    // #4720: the bare positional is entity-first, but keyless/casual usage
+    // treats it as a literal word from fact text (`gbrain recall commas`).
+    // resolveEntitySlug never returns null for non-empty input (slugify is
+    // the floor), so an unknown term becomes a phantom slug that matches
+    // nothing and recall reports zero results while `recall --all` and
+    // `--grep` both find the fact. When the entity arm comes up empty, fall
+    // back to the SQL-level fact-text grep (the same pre-limit arm --grep
+    // uses) with a stderr note. Explicit --grep callers keep exact
+    // semantics (their filter already ran; no fallback surprise). Gating +
+    // note are shared with the thin-client mirror in runRecallOnce.
+    if (entityTextFallbackApplies(flags, rows.length)) {
+      const textRows = await engine.listFactsSince(sourceId, new Date(0), {
+        eventTime: true,
+        activeOnly: !flags.includeExpired,
+        limit: flags.limit,
+        grep: flags.entity.toLowerCase(),
+        excludeAuditRows: true,
+      });
+      if (textRows.length > 0) {
+        noteEntityTextFallback(flags.entity, textRows.length);
+        return textRows;
+      }
+    }
+    return rows;
   }
   if (flags.sessionId) {
     return engine.listFactsBySession(sourceId, flags.sessionId, {
       activeOnly: !flags.includeExpired,
       limit: flags.limit,
+      excludeAuditRows: true,
     });
   }
   if (resolvedSince) {
+    // Post-review fix: `--since-last-run`/`--watch` resolve `resolvedSince`
+    // from a cursor written as the PRIOR RUN's wall-clock start time
+    // (`writeCursor(sourceId, tStart, ...)` in runRecallOnce — creation-time
+    // semantics). Comparing that cursor against event time
+    // (COALESCE(valid_from, created_at)) drops rows created after the cursor
+    // but backdated to an earlier valid_from — a delayed extraction of a
+    // past conversation would never surface on the next tick. An explicit
+    // `--since DURATION`/`--today` cutoff is a genuine "what happened in
+    // this window" question and keeps event-time ordering.
     return engine.listFactsSince(sourceId, resolvedSince, {
+      eventTime: !flags.sinceLastRun,
       activeOnly: !flags.includeExpired,
       limit: flags.limit,
+      excludeAuditRows: true,
     });
   }
   return engine.listFactsSince(sourceId, new Date(0), {
+    eventTime: true,
     activeOnly: !flags.includeExpired,
     limit: flags.limit,
+    excludeAuditRows: true,
   });
 }
 

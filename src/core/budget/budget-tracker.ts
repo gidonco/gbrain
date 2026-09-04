@@ -78,6 +78,85 @@ export interface BudgetTrackerOpts {
   label: string;
   /** Override the audit file path (tests + custom installers). */
   auditPath?: string;
+  /**
+   * #4312 — operator config-plane price overrides (`pricing.overrides`),
+   * normalized via parsePricingOverrides. Consulted BEFORE the shipped
+   * pricing tables in every cost computation, so an operator routing through
+   * a proxy (LiteLLM fronting a paid provider — chat AND embed) can declare
+   * their real rate instead of TX2 no_pricing hard-failing under --max-cost.
+   * Models with neither a table row nor an override stay fail-closed.
+   */
+  pricingOverrides?: PricingOverrides;
+}
+
+/**
+ * #4312 — normalized operator price overrides: model string (lowercased) →
+ * per-1M-token pricing. Declared in the config plane as JSON, e.g.
+ *   gbrain config set pricing.overrides '{"litellm:gpt-4o": {"input": 2.5, "output": 10}, "litellm:text-embedding-3-large": 0.13}'
+ * A bare number means one rate for input AND output tokens (embeddings only
+ * ever bill input, so a scalar is the natural spelling there).
+ */
+export type PricingOverrides = Record<string, ModelPricing>;
+
+/**
+ * Parse the raw `pricing.overrides` config value (JSON string or object) into
+ * a normalized PricingOverrides map. Invalid entries are DROPPED (the model
+ * stays unpriced → the TX2 fail-closed contract still applies to it); a
+ * wholly-unparseable value yields undefined. Never throws.
+ */
+export function parsePricingOverrides(raw: unknown): PricingOverrides | undefined {
+  let value: unknown = raw;
+  if (value == null) return undefined;
+  if (typeof value === 'string') {
+    const s = value.trim();
+    if (!s) return undefined;
+    try {
+      value = JSON.parse(s);
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const isRate = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0;
+  const out: PricingOverrides = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    const key = k.trim().toLowerCase();
+    if (!key) continue;
+    if (isRate(v)) {
+      out[key] = { input: v, output: v };
+      continue;
+    }
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const obj = v as { input?: unknown; output?: unknown; pricePerMTok?: unknown };
+      const input = obj.input ?? obj.pricePerMTok;
+      if (isRate(input) && (obj.output === undefined || isRate(obj.output))) {
+        out[key] = { input, output: (obj.output as number | undefined) ?? input };
+      }
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Load + parse operator price overrides from the DB config plane
+ * (`pricing.overrides`). Fail-open to undefined — a config read failure must
+ * never block a run; the affected models simply keep the fail-closed
+ * no-pricing behavior.
+ */
+export async function loadPricingOverrides(
+  engine: { getConfig(key: string): Promise<string | null> },
+): Promise<PricingOverrides | undefined> {
+  try {
+    return parsePricingOverrides(await engine.getConfig('pricing.overrides'));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Exact-key override lookup (keys normalized to lowercase at parse time). */
+function overrideFor(modelId: string, overrides?: PricingOverrides): ModelPricing | null {
+  if (!overrides) return null;
+  return overrides[modelId.trim().toLowerCase()] ?? null;
 }
 
 export class BudgetExhausted extends Error {
@@ -136,12 +215,6 @@ const FREE_LOCAL_RERANK_PROVIDERS: ReadonlySet<string> = new Set([
   'llama-server-reranker',
 ]);
 
-const PAID_RERANK_PRICING: Readonly<Record<string, ModelPricing>> = {
-  'zeroentropyai:zerank-2': { input: 0.025, output: 0 },
-  'zeroentropyai:zerank-1': { input: 0.025, output: 0 },
-  'zeroentropyai:zerank-1-small': { input: 0.025, output: 0 },
-};
-
 /**
  * Provider id prefixes whose embeddings run on local inference (electricity,
  * not API tokens) and so price at $0. Without this, a `--max-cost`-bounded
@@ -149,15 +222,35 @@ const PAID_RERANK_PRICING: Readonly<Record<string, ModelPricing>> = {
  * lookupEmbeddingPrice has no entry for them. Matched against the provider
  * half of the `provider:model` string.
  *
- * 'lmstudio' is intentionally excluded — no lmstudio recipe is registered, so
- * `lmstudio:` model strings never resolve (the env mapping in cli.ts is
- * pre-existing dead plumbing). 'litellm' is excluded too — a LiteLLM proxy can
- * front a paid provider, so pricing-unknown is the honest state there.
+ * 'litellm' is excluded — a LiteLLM proxy can front a paid provider, so
+ * pricing-unknown is the honest state there.
  *
  * Sibling to FREE_LOCAL_RERANK_PROVIDERS; v0.41+ TODO unifies them via
  * recipe-cost-driven resolution.
  */
 const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
+  'ollama',
+  'llama-server',
+  'lmstudio',
+]);
+
+/**
+ * Chat sibling of FREE_LOCAL_EMBED_PROVIDERS / FREE_LOCAL_RERANK_PROVIDERS.
+ *
+ * Local inference costs electricity, not tokens, so these providers price at
+ * $0 rather than TX2 hard-failing. Without this a caller that sets ANY cost cap
+ * cannot use a local chat model at all: CANONICAL_PRICING has no `ollama:*`
+ * keys, so `reserve()` throws no_pricing before the first call and every work
+ * item is skipped with `budget_exhausted: true` at $0 spent.
+ *
+ * That is not theoretical — `cycle.extract_atoms` always constructs its tracker
+ * with `maxCostUsd` (config only accepts `n > 0`, so the cap can't be unset),
+ * which made `models.dream.extract_atoms: ollama:*` silently extract nothing.
+ *
+ * `litellm` is excluded on purpose, matching the embed set: a LiteLLM proxy can
+ * front a paid provider, so pricing-unknown is the honest state there.
+ */
+const FREE_LOCAL_CHAT_PROVIDERS: ReadonlySet<string> = new Set([
   'ollama',
   'llama-server',
 ]);
@@ -167,14 +260,21 @@ const FREE_LOCAL_EMBED_PROVIDERS: ReadonlySet<string> = new Set([
  * per-1M-token price tuple, or null when unknown.
  *
  * Strategy:
- *   - Chat: use the canonical provider/model lookup shared by the gateway,
- *     covering Anthropic, OpenAI, Google, and aliases.
+ *   - Chat: try the bare model id in ANTHROPIC_PRICING first (legacy keys
+ *     are bare claude-* ids), then the canonical paid-cloud chat table
+ *     for provider-prefixed OpenAI/Google/DeepSeek/Together ids, then the
+ *     explicit zero-cost local provider set.
  *   - Embed: lookupEmbeddingPrice handles the provider:model form; on a miss,
  *     local-inference providers (FREE_LOCAL_EMBED_PROVIDERS) price at $0 so
  *     `--max-cost` callers don't hard-fail.
- *   - Rerank: use the hosted reranker input-token table; local providers in
- *     FREE_LOCAL_RERANK_PROVIDERS return zero pricing; everything else is
- *     unknown and therefore fails closed when a cap is active.
+ *   - Rerank: try ANTHROPIC_PRICING (legacy path for any Claude-priced
+ *     rerank); else try lookupEmbeddingPrice — paid rerank providers (e.g.
+ *     ZeroEntropy's zerank-2) share the same provider:model-keyed,
+ *     $/1M-token table as their embedding siblings, so it's reused here
+ *     rather than duplicated into a third table; else if the provider half
+ *     is in FREE_LOCAL_RERANK_PROVIDERS, return zero pricing so `--max-cost`
+ *     callers don't TX2 hard-fail on local inference recipes (electricity,
+ *     not tokens); else unknown.
  */
 function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
   if (kind === 'embed') {
@@ -188,18 +288,26 @@ function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
     }
     return null;
   }
-  if (kind === 'chat') {
-    return canonicalLookup(modelId) ?? null;
-  }
-  // Rerank uses its own per-input-token table.
+  // chat or rerank: try bare key first, then provider:model or provider/model.
   // v0.41.21.0: route through splitProviderModelId so slash-prefixed ids
   // (the form `--judge-model` and OpenRouter recipes emit) hit the pricing
   // table. Pre-fix, slash-form silently no_pricing-failed `--max-cost` on
   // brainstorm/lsd.
+  const bare = ANTHROPIC_PRICING[modelId];
+  if (bare) return bare;
   const { provider: providerId, model: modelTail } = splitProviderModelId(modelId);
-  const rerankKey = providerId && modelTail ? `${providerId}:${modelTail}` : modelId;
-  const hostedRerank = PAID_RERANK_PRICING[rerankKey];
-  if (hostedRerank) return hostedRerank;
+  if (modelTail) {
+    const tailHit = ANTHROPIC_PRICING[modelTail];
+    if (tailHit) return tailHit;
+  }
+  // Paid rerank providers (e.g. ZeroEntropy's zerank-2) aren't Claude-priced,
+  // so they miss the ANTHROPIC_PRICING checks above. Reuse the embedding
+  // pricing table (issue #3223) — same provider:model key shape, same
+  // $/1M-token unit — instead of hand-copying a third pricing surface.
+  if (kind === 'rerank') {
+    const hit = lookupEmbeddingPrice(modelId);
+    if (hit.kind === 'known') return { input: hit.pricePerMTok, output: 0 };
+  }
   // v0.40.6.1: zero-price local-inference rerank providers so the budget
   // tracker's TX2 hard-fail doesn't trip on `llama-server-reranker:<model>`
   // under `--max-cost`. Only the rerank kind — chat/embed already have
@@ -207,11 +315,43 @@ function lookupPricing(modelId: string, kind: BudgetKind): ModelPricing | null {
   if (kind === 'rerank' && providerId && FREE_LOCAL_RERANK_PROVIDERS.has(providerId)) {
     return { input: 0, output: 0 };
   }
+  // Fall back to the full canonical pricing table so non-Anthropic chat
+  // models with a known price (openai:*, google:*, deepseek:*) resolve under
+  // --max-cost instead of TX2 no_pricing hard-failing at $0. ANTHROPIC_PRICING
+  // above is only the bare-keyed Claude view.
+  const canon = canonicalLookup(modelId);
+  if (canon) return canon;
+  // Local-inference chat providers cost electricity, not tokens. Checked AFTER
+  // the canonical table so an explicitly-priced local entry, should one ever be
+  // added, still wins over the blanket zero.
+  if (kind === 'chat' && providerId && FREE_LOCAL_CHAT_PROVIDERS.has(providerId)) {
+    return { input: 0, output: 0 };
+  }
   return null;
 }
 
-export function costForUsage(modelId: string, inputTokens: number, outputTokens: number, kind: BudgetKind): number | null {
-  const p = lookupPricing(modelId, kind);
+/**
+ * True when the budget tracker can price this model, i.e. when setting a cost
+ * cap is meaningful. Callers that apply a *default* cap (rather than one the
+ * user asked for) should skip the cap when this returns false — otherwise
+ * `reserve()` hard-fails with BudgetExhausted(reason:'no_pricing') and the
+ * caller silently does no work.
+ */
+export function isModelPriceable(modelId: string, kind: BudgetKind, overrides?: PricingOverrides): boolean {
+  return overrideFor(modelId, overrides) !== null || lookupPricing(modelId, kind) !== null;
+}
+
+export function costForUsage(
+  modelId: string,
+  inputTokens: number,
+  outputTokens: number,
+  kind: BudgetKind,
+  overrides?: PricingOverrides,
+): number | null {
+  // #4312: operator overrides win — the operator owns their bill (negotiated
+  // rates, proxy routes the shipped tables can't know about). Missing both →
+  // null, and the TX2 fail-closed contract in reserve() still applies.
+  const p = overrideFor(modelId, overrides) ?? lookupPricing(modelId, kind);
   if (!p) return null;
   return (inputTokens / 1_000_000) * p.input + (outputTokens / 1_000_000) * p.output;
 }
@@ -228,6 +368,15 @@ export function estimateBudgetCostUsd(estimate: BudgetEstimate): number | null {
 
 export class BudgetTracker {
   private cumulativeUsd = 0;
+  /**
+   * #4365 — sum of projections reserved but not yet record()ed. Concurrent
+   * callers (e.g. skillopt's validation gate, concurrency 4) all pass
+   * admission against cumulativeUsd alone, breaching the cap by up to
+   * (N-1)×per-call cost. Admission checks cumulative + outstanding instead.
+   */
+  private outstandingUsd = 0;
+  /** FIFO of unsettled projections keyed `${modelId}|${kind}` (gateway pairs reserve→record 1:1). */
+  private readonly outstandingByKey = new Map<string, number[]>();
   private callsRecorded = 0;
   private readonly startedAt: number;
   private readonly auditPath: string;
@@ -283,6 +432,7 @@ export class BudgetTracker {
       estimate.estimatedInputTokens,
       estimate.maxOutputTokens,
       estimate.kind,
+      this.opts.pricingOverrides,
     );
 
     if (projected === null) {
@@ -290,13 +440,25 @@ export class BudgetTracker {
         // TX2: hard-fail when a cap is set but pricing is missing — without
         // pricing we can't enforce the cap, and silently ignoring it would
         // void the contract.
-        const pricingFile = estimate.kind === 'embed'
-          ? 'embedding-pricing.ts'
-          : estimate.kind === 'chat'
-            ? 'model-pricing.ts'
-            : 'budget/budget-tracker.ts';
+        const pricingFile = estimate.kind === 'chat' ? 'model-pricing.ts' : 'embedding-pricing.ts';
         const msg = `${this.opts.label}: no pricing entry for model "${estimate.modelId}" (kind=${estimate.kind}). ` +
-          `Add it to src/core/${pricingFile} or drop --max-cost.`;
+          `Add it to src/core/${pricingFile}, declare an operator rate via ` +
+          `\`gbrain config set pricing.overrides '{"${estimate.modelId}": <usd-per-1M-tokens>}'\` (#4312), ` +
+          `or drop --max-cost.`;
+        appendAuditLine(this.auditPath, {
+          schema_version: 1,
+          ts: new Date().toISOString(),
+          event: 'reserve_no_pricing',
+          label: this.opts.label,
+          kind: estimate.kind,
+          model: estimate.modelId,
+          sub_label: estimate.label,
+          estimated_input_tokens: estimate.estimatedInputTokens,
+          max_output_tokens: estimate.maxOutputTokens,
+          cumulative_cost_usd: this.cumulativeUsd,
+          max_cost_usd: this.opts.maxCostUsd,
+          reason: 'no_pricing',
+        });
         this.fireExhausted();
         throw new BudgetExhausted(msg, {
           reason: 'no_pricing',
@@ -329,7 +491,7 @@ export class BudgetTracker {
     }
 
     if (this.opts.maxCostUsd !== undefined) {
-      const after = this.cumulativeUsd + projected;
+      const after = this.cumulativeUsd + this.outstandingUsd + projected;
       if (after > this.opts.maxCostUsd) {
         appendAuditLine(this.auditPath, {
           schema_version: 1,
@@ -341,15 +503,23 @@ export class BudgetTracker {
           sub_label: estimate.label,
           projected_cost_usd: projected,
           cumulative_cost_usd: this.cumulativeUsd,
+          outstanding_usd: this.outstandingUsd,
           max_cost_usd: this.opts.maxCostUsd,
         });
         this.fireExhausted();
         throw new BudgetExhausted(
           `${this.opts.label}: projected cost $${after.toFixed(4)} exceeds --max-cost $${this.opts.maxCostUsd.toFixed(2)} ` +
-            `(cumulative $${this.cumulativeUsd.toFixed(4)} + this call $${projected.toFixed(4)})`,
+            `(cumulative $${this.cumulativeUsd.toFixed(4)} + outstanding $${this.outstandingUsd.toFixed(4)} + this call $${projected.toFixed(4)})`,
           { reason: 'cost', spent: this.cumulativeUsd, cap: this.opts.maxCostUsd, modelId: estimate.modelId },
         );
       }
+      // Admission passed — hold the projection until record() settles it so
+      // parallel reserve() calls can't all admit against the same cumulative.
+      const key = `${estimate.modelId}|${estimate.kind}`;
+      const queue = this.outstandingByKey.get(key) ?? [];
+      queue.push(projected);
+      this.outstandingByKey.set(key, queue);
+      this.outstandingUsd += projected;
     }
 
     appendAuditLine(this.auditPath, {
@@ -378,7 +548,13 @@ export class BudgetTracker {
   record(actual: BudgetActualUsage & { kind?: BudgetKind }): void {
     this.callsRecorded++;
     const kind: BudgetKind = actual.kind ?? 'chat';
-    const cost = costForUsage(actual.modelId, actual.inputTokens, actual.outputTokens ?? 0, kind);
+    const cost = costForUsage(
+      actual.modelId,
+      actual.inputTokens,
+      actual.outputTokens ?? 0,
+      kind,
+      this.opts.pricingOverrides,
+    );
 
     if (cost === null) {
       // Unpriced model: record audit but skip cumulative math. Cap (if set)
@@ -399,6 +575,7 @@ export class BudgetTracker {
       return;
     }
 
+    this.settleReservation(actual.modelId, kind);
     this.cumulativeUsd += cost;
     appendAuditLine(this.auditPath, {
       schema_version: 1,
@@ -435,6 +612,34 @@ export class BudgetTracker {
       maxRuntimeMs: this.opts.maxRuntimeMs,
       callsRecorded: this.callsRecorded,
     };
+  }
+
+  /**
+   * Release the oldest unsettled reservation for this call's model+kind.
+   * Exact key first; on miss, the oldest same-kind entry — gateway.chat
+   * reserves with the pre-resolution model string (alias/bare/slash form)
+   * but records `${recipe.id}:${modelId}`, and a missed pop would leak
+   * phantom outstanding budget for the tracker's lifetime. Records with no
+   * reservation at all (expand/OCR spend sites) pop nothing.
+   */
+  private settleReservation(modelId: string, kind: BudgetKind): void {
+    let key = `${modelId}|${kind}`;
+    let queue = this.outstandingByKey.get(key);
+    if (!queue || queue.length === 0) {
+      const suffix = `|${kind}`;
+      queue = undefined;
+      for (const [k, q] of this.outstandingByKey) {
+        if (k.endsWith(suffix) && q.length > 0) {
+          key = k;
+          queue = q;
+          break;
+        }
+      }
+    }
+    if (!queue || queue.length === 0) return;
+    const amount = queue.shift()!;
+    if (queue.length === 0) this.outstandingByKey.delete(key);
+    this.outstandingUsd = Math.max(0, this.outstandingUsd - amount);
   }
 
   /** Internal helper: throw BudgetExhausted(reason:'runtime') when the wall-clock cap fires. */

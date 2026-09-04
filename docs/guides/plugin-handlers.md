@@ -1,7 +1,12 @@
 # Plugin handlers — registering host-specific Minion handlers
 
-GBrain's Minion worker ships with seven built-in handlers: `sync`,
-`embed`, `lint`, `import`, `extract`, `backlinks`, `autopilot-cycle`.
+GBrain's Minion worker ships with a full set of built-in handlers,
+registered by `registerBuiltinHandlers` in `src/commands/jobs.ts` —
+that registry is the source of truth. Examples: `sync`, `embed`,
+`lint`, `import`, `extract`, `backlinks`, `autopilot-cycle`, `shell`,
+`subagent`, `orphans`, `integrity`, plus dream-cycle phases and other
+maintenance jobs. Submitting an unknown job name with
+`gbrain jobs submit <name> --follow` prints the full registered list.
 These cover every background operation the gbrain CLI itself performs.
 
 Host platforms (OpenClaw deployments, future hosts) register their own
@@ -10,14 +15,17 @@ handlers via a plugin bootstrap that imports
 code, loaded by the worker, with the same trust model as any other
 code in the host's repo.
 
+> **Two plugin systems.** This doc covers *job handlers* (code the Minion
+> worker runs). Custom *subagent definitions* (markdown prompts loaded via
+> `GBRAIN_PLUGIN_PATH`) are a separate system — see
+> [plugin-authors.md](plugin-authors.md).
+
 ## Why code, not data
 
-An earlier design draft shipped `~/.claude/gbrain-handlers.json` where
-each entry was a shell command the worker would exec on job claim.
-Codex flagged this as a durable RCE surface: an agent-writable data
-file that spawns arbitrary shell. We dropped the data-file approach;
-handlers are code that the host imports explicitly and ships through
-code review.
+A handlers data file (each entry a shell command the worker execs on job
+claim) is a durable RCE surface: an agent-writable file that spawns
+arbitrary shell. Handlers are therefore code that the host imports
+explicitly and ships through code review.
 
 ## The plugin contract
 
@@ -64,14 +72,23 @@ auto-loads on startup (configurable via a host-provided entry point).
 
 ## Handler contract
 
-Every handler receives a `MinionJobContext`:
+Every handler receives a `MinionJobContext` (canonical definition:
+`src/core/minions/types.ts`). The load-bearing fields:
 
 ```ts
 interface MinionJobContext {
-  data: Record<string, unknown>;   // job params (whatever the cron submit passed)
-  job: MinionJob;                   // full job row (id, queue, attempts, etc.)
-  signal: AbortSignal;              // set to aborted when the worker is shutting down
-  inbox: MinionInbox;               // read messages sent to this job while it runs
+  id: number;                       // job id
+  name: string;                     // job type
+  data: Record<string, unknown>;    // job params (whatever the cron submit passed)
+  attempts_made: number;
+  signal: AbortSignal;              // fires on timeout, cancel, pause, or lock loss
+  shutdownSignal: AbortSignal;      // fires only on worker SIGTERM/SIGINT
+  deadlineAtMs: number | null;      // wall-clock deadline from timeout_at, if set
+  updateProgress(progress: unknown): Promise<void>;
+  updateTokens(tokens: TokenUpdate): Promise<void>;
+  log(message: string | TranscriptEntry): Promise<void>;
+  isActive(): Promise<boolean>;     // is the job lock still held?
+  readInbox(): Promise<InboxMessage[]>;  // unread messages sent to this job
 }
 ```
 
@@ -89,7 +106,7 @@ fires while the previous invocation is still running.
 
 ## Gbrain's migration flow
 
-The v0.11.0 migration orchestrator (run by `gbrain apply-migrations`)
+The migration orchestrator (run by `gbrain apply-migrations`)
 detects cron entries whose handler name is NOT in GBrain's builtin set
 and emits a structured TODO to `~/.gbrain/migrations/pending-host-work.jsonl`.
 Each TODO has shape:
@@ -113,7 +130,7 @@ The host agent walks these entries using `skills/migrations/v0.11.0.md`:
    registration in the host's worker bootstrap following the pattern
    above.
 3. Deploy the updated worker.
-4. Re-run `gbrain apply-migrations --yes`. The orchestrator now
+4. Re-run `gbrain apply-migrations --yes`. The orchestrator
    recognizes the newly-registerable handler (worker writes the
    registered names to a discovery file on startup) and rewrites the
    cron entry to use `gbrain jobs submit`. The JSONL row is marked

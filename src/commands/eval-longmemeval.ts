@@ -1,8 +1,9 @@
 /**
  * v0.28.1: `gbrain eval longmemeval <dataset.jsonl>` — public LongMemEval
  * benchmark adapter. Spins up an in-memory PGLite, imports each question's
- * haystack, runs hybridSearch, optionally generates an answer via Anthropic,
- * emits hypothesis JSONL on stdout for downstream `evaluate_qa.py`.
+ * haystack, runs hybridSearch, optionally generates an answer via the
+ * configured gateway chat model, emits hypothesis JSONL on stdout for
+ * downstream `evaluate_qa.py`.
  *
  * Hermetic by design: cli.ts skips connectEngine() when this subcommand
  * is invoked, so the user's ~/.gbrain brain is never opened. Tests stub
@@ -10,7 +11,7 @@
  */
 
 import { readFileSync, existsSync, openSync, writeSync, closeSync, writeFileSync } from 'fs';
-import Anthropic from '@anthropic-ai/sdk';
+import type Anthropic from '@anthropic-ai/sdk';
 import { withBenchmarkBrain, resetTables } from '../eval/longmemeval/harness.ts';
 import { haystackToPages, type LongMemEvalQuestion } from '../eval/longmemeval/adapter.ts';
 import { renderChatBlock, type ChatSessionForPrompt } from '../eval/longmemeval/sanitize.ts';
@@ -33,6 +34,8 @@ import {
   type AliasMap,
 } from '../eval/longmemeval/extract.ts';
 import { extractCandidateEntities } from '../core/think/entity-extract.ts';
+import { normalizeModelId } from '../core/model-id.ts';
+import { chat as gatewayChat } from '../core/ai/gateway.ts';
 import { resolveEntitySlugWithSource, type ResolutionSource } from '../core/entities/resolve.ts';
 import { formatTrajectoryBlock } from '../core/trajectory-format.ts';
 
@@ -364,12 +367,12 @@ async function generateAnswer(
 }
 
 export interface RunOpts {
-  /** Inject an Anthropic client for tests; defaults to a fresh SDK client. */
+  /** Inject a chat client for tests; defaults to the gateway-routed client (#4636). */
   client?: ThinkLLMClient;
   /**
    * v0.40.2.0 — separate stub for the Haiku claim extractor. Tests can
    * isolate "extractor stubbed, answer-gen real" from "extractor real,
-   * answer-gen stubbed". Defaults to the same SDK client when omitted.
+   * answer-gen stubbed". Defaults to the same gateway client when omitted.
    */
   extractorClient?: ThinkLLMClient;
   /**
@@ -392,6 +395,12 @@ export interface RunOpts {
    * a production engine with real data would clobber it via resetTables.
    */
   engine?: PGLiteEngine;
+  /**
+   * v0.45.0+ (#3676): live nightly-probe search-mode/reranker settings copied
+   * into the isolated benchmark brain. This preserves benchmark data isolation
+   * while keeping the probe on the operator-selected retrieval pipeline.
+   */
+  searchConfigSnapshot?: Record<string, string>;
 }
 
 export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}): Promise<void> {
@@ -468,16 +477,53 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
     fallback: 'sonnet',
   });
 
-  // Wrap Anthropic SDK so its `.messages.create` shape matches ThinkLLMClient.
-  // Same pattern as src/core/think/index.ts:247-249.
-  const realClient = new Anthropic();
-  const client: ThinkLLMClient = runOpts.client ?? {
-    create: (params, callOpts) => realClient.messages.create(params, callOpts),
+  // #4636: BOTH chat lanes (answer generation + trajectory claim extractor)
+  // route through the configured AI gateway — the same provider routing the
+  // rest of the brain uses. cli.ts configures the gateway before invoking
+  // this command; the autopilot nightly probe runs in a process that already
+  // configured it at connect. The previous raw Anthropic SDK client ignored
+  // the installation's provider routing entirely, so a non-Anthropic install
+  // failed every answer/extractor call — surfacing as false all-
+  // upstream_error batches in the nightly quality probe. gateway.chat parses
+  // `provider:model` recipe ids, so resolveModel's output passes through
+  // UN-stripped (the old splitProviderModelId strip was the raw-SDK
+  // workaround); normalizeModelId prefixes bare Anthropic ids.
+  const gatewayClient: ThinkLLMClient = {
+    create: async (params) => {
+      const system = typeof params.system === 'string'
+        ? params.system
+        : Array.isArray(params.system)
+          ? params.system.map(b => ('text' in b ? b.text : '')).join('')
+          : undefined;
+      const messages = params.messages.map(m => ({
+        role: m.role,
+        content: typeof m.content === 'string'
+          ? m.content
+          : Array.isArray(m.content)
+            ? m.content.map(b => ('text' in b ? b.text : '')).join('')
+            : '',
+      }));
+      const result = await gatewayChat({
+        model: normalizeModelId(params.model),
+        system,
+        messages,
+        maxTokens: params.max_tokens,
+      });
+      return {
+        id: '',
+        type: 'message',
+        role: 'assistant',
+        model: result.model,
+        content: [{ type: 'text', text: result.text }],
+        usage: { input_tokens: result.usage.input_tokens, output_tokens: result.usage.output_tokens },
+        stop_reason: result.stopReason === 'length' ? 'max_tokens' : 'end_turn',
+      } as unknown as Anthropic.Message;
+    },
   };
-  // v0.40.2.0 — separate extractor client (defaults to same SDK).
-  const extractorClient: ThinkLLMClient = runOpts.extractorClient ?? {
-    create: (params, callOpts) => realClient.messages.create(params, callOpts),
-  };
+  const client: ThinkLLMClient = runOpts.client ?? gatewayClient;
+  // v0.40.2.0 — separate extractor client (defaults to the same gateway client;
+  // the per-call params.model keeps the two lanes' models independent).
+  const extractorClient: ThinkLLMClient = runOpts.extractorClient ?? gatewayClient;
   const trajectoryEnabled = !opts.noTrajectory;
   const extractorModel = trajectoryEnabled
     ? await resolveModel(null, {
@@ -517,7 +563,15 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
   // already calls resetTables() as its first line so the prior caller's
   // pages are cleared on the first question of this run.
   const work = async (engine: PGLiteEngine): Promise<void> => {
-    // v0.32.3 search-lite: thread --mode into the in-memory brain's config.
+    // v0.45.0+ (#3676): nightly probe callers may copy audited live search
+    // config into this isolated engine. Data tables stay hermetic, but the
+    // benchmark no longer silently evaluates a different reranker/mode.
+    for (const [key, value] of Object.entries(runOpts.searchConfigSnapshot ?? {})) {
+      if (key.trim().length > 0) {
+        await engine.setConfig(key, value);
+      }
+    }
+    // v0.32.3 search-lite: explicit --mode wins over any injected snapshot.
     // resetTables preserves `config` between questions, so this fires once
     // for the run. hybridSearch resolves it through the standard chain.
     if (opts.mode) {
@@ -751,6 +805,11 @@ async function runOneQuestion(
     // v0.40.1.0 (Track D / T2) — copy question_type into the row so the
     // by_type_summary can be rebuilt from the file on resume runs.
     question_type: q.question_type,
+    // Gold answer for downstream consumers that verify correctness (the
+    // cross-modal --batch judge folds it into the task; evaluate_qa.py
+    // ignores unknown fields). Without it a judge can't validate a terse
+    // factual hypothesis against a haystack it never saw.
+    ...(q.answer !== undefined ? { answer: q.answer } : {}),
     hypothesis,
     retrieved_session_ids: retrievedSessionIds,
     ...(recallHit !== undefined ? { recall_hit: recallHit } : {}),

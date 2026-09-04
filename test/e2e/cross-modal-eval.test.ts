@@ -45,7 +45,7 @@ afterEach(() => {
 
 function makeChatStub(scoresBySlot: Record<string, number[]>) {
   let callIdx = 0;
-  const order = ['openai:gpt-4o', 'anthropic:claude-opus-4-7', 'google:gemini-1.5-pro'];
+  const order = ['openai:gpt-5.2', 'anthropic:claude-opus-4-7', 'deepseek:deepseek-v4-pro'];
   return mock(async (opts: { model?: string }) => {
     const model = opts.model ?? '';
     callIdx++;
@@ -71,12 +71,55 @@ function makeChatStub(scoresBySlot: Record<string, number[]>) {
   });
 }
 
+describe('gbrain eval cross-modal — judge call shape (#4338 data boundary)', () => {
+  test('callSlot sends EVALUATOR_SYSTEM_PROMPT as `system` and the data-bounded prompt as the user turn', async () => {
+    const seen: Array<{ system?: string; messages?: Array<{ role: string; content: string }> }> = [];
+    const chatStub = mock(async (opts: { model?: string; system?: string; messages?: Array<{ role: string; content: string }> }) => {
+      seen.push({ system: opts.system, messages: opts.messages });
+      const model = opts.model ?? '';
+      return {
+        text: JSON.stringify({ scores: { goal: { score: 8 }, depth: { score: 8 } }, overall: 8, improvements: ['1. x'] }),
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model,
+        providerId: model.split(':')[0]!,
+      };
+    });
+    mock.module('../../src/core/ai/gateway.ts', () => ({
+      chat: chatStub,
+      configureGateway,
+      isAvailable: () => true,
+    }));
+
+    const { runEval, EVALUATOR_SYSTEM_PROMPT } = await import('../../src/core/cross-modal-eval/runner.ts');
+    await runEval({
+      task: 'sample task',
+      output: 'sample output content',
+      slug: 'demo-shape',
+      receiptDir: tempDir,
+      cycles: 1,
+    });
+
+    expect(seen.length).toBeGreaterThan(0);
+    for (const call of seen) {
+      // The hardened grading-function contract rides in `system`, never
+      // inlined into the user turn where candidate text could shadow it.
+      expect(call.system).toBe(EVALUATOR_SYSTEM_PROMPT);
+      expect(call.messages).toHaveLength(1);
+      expect(call.messages![0]!.role).toBe('user');
+      expect(call.messages![0]!.content).toContain('<task_to_grade>');
+      expect(call.messages![0]!.content).toContain('<candidate_output>\nsample output content\n</candidate_output>');
+    }
+  });
+});
+
 describe('gbrain eval cross-modal — runner verdict contract', () => {
   test('PASS: 3 happy responses, all dims >=7', async () => {
     const chatStub = makeChatStub({
-      'openai:gpt-4o': [9, 8],
+      'openai:gpt-5.2': [9, 8],
       'anthropic:claude-opus-4-7': [8, 7],
-      'google:gemini-1.5-pro': [8, 8],
+      'deepseek:deepseek-v4-pro': [8, 8],
     });
     mock.module('../../src/core/ai/gateway.ts', () => ({
       chat: chatStub,
@@ -105,9 +148,9 @@ describe('gbrain eval cross-modal — runner verdict contract', () => {
 
   test('FAIL: one dim mean below 7', async () => {
     const chatStub = makeChatStub({
-      'openai:gpt-4o': [9, 6],
+      'openai:gpt-5.2': [9, 6],
       'anthropic:claude-opus-4-7': [8, 6],
-      'google:gemini-1.5-pro': [8, 6],
+      'deepseek:deepseek-v4-pro': [8, 6],
     });
     mock.module('../../src/core/ai/gateway.ts', () => ({
       chat: chatStub,
@@ -130,9 +173,9 @@ describe('gbrain eval cross-modal — runner verdict contract', () => {
 
   test('FAIL: min-score floor caught when one model scores <5 (Q2)', async () => {
     const chatStub = makeChatStub({
-      'openai:gpt-4o': [9, 8],
+      'openai:gpt-5.2': [9, 8],
       'anthropic:claude-opus-4-7': [8, 8],
-      'google:gemini-1.5-pro': [4, 8], // goal=4 trips the floor
+      'deepseek:deepseek-v4-pro': [4, 8], // goal=4 trips the floor
     });
     mock.module('../../src/core/ai/gateway.ts', () => ({
       chat: chatStub,
@@ -155,7 +198,7 @@ describe('gbrain eval cross-modal — runner verdict contract', () => {
 
   test('INCONCLUSIVE: 2 of 3 mock 5xx -> exit 2 contract (Q3)', async () => {
     const chatStub = mock(async (opts: { model?: string }) => {
-      if (opts.model === 'openai:gpt-4o') {
+      if (opts.model === 'openai:gpt-5.2') {
         return {
           text: JSON.stringify({
             scores: { goal: { score: 8 } },

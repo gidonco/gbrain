@@ -9,10 +9,15 @@ import {
   RemoteUrlError,
   cloneRepo,
   pullRepo,
+  fetchRemote,
   GitOperationError,
   validateRepoState,
+  buildGitEnv,
+  GIT_ENV,
 } from '../src/core/git-remote.ts';
+import { execFileSync } from 'child_process';
 import { withEnv } from './helpers/with-env.ts';
+import { gitStderrLeads } from './helpers/git-stderr-probe.ts';
 
 // ---------------------------------------------------------------------------
 // Fake-git harness: write a shell script that records its argv to a log file,
@@ -380,13 +385,35 @@ describe('validateRepoState', () => {
     expect(validateRepoState(p)).toBe('no-git');
   });
 
-  test("returns 'corrupted' when git remote get-url fails", async () => {
+  test("returns 'corrupted' when git itself fails (get-url AND the rev-parse integrity probe)", async () => {
+    // #4559: with no expectedRemoteUrl, a get-url failure alone is no longer
+    // corruption — the rev-parse integrity probe decides. Fake-git mode
+    // 'fail' fails BOTH, so this still classifies as corrupted.
     const p = join(fixtureDir, 'corrupted-repo');
     mkdirSync(join(p, '.git'), { recursive: true });
     setMode('fail');
     await withEnv({ PATH: fakePath() }, async () => {
       expect(validateRepoState(p)).toBe('corrupted');
     });
+  });
+
+  test("returns 'healthy' for a local-only repo with no origin remote (#4559)", () => {
+    // Real git: a repo with no remotes is a supported local-only shape.
+    // `git remote get-url origin` exits non-zero, but the repository is
+    // intact — with no expectedRemoteUrl this must NOT read as corrupted.
+    const p = join(fixtureDir, 'local-only-repo');
+    mkdirSync(p, { recursive: true });
+    execFileSync('git', ['-C', p, 'init', '-q'], { stdio: 'pipe' });
+    expect(validateRepoState(p)).toBe('healthy');
+  });
+
+  test("still returns 'corrupted' when a remote WAS expected but origin is missing (#4559)", () => {
+    // Managed-clone semantics preserved: a configured expectedRemoteUrl with
+    // no origin remains corruption.
+    const p = join(fixtureDir, 'managed-clone-missing-origin');
+    mkdirSync(p, { recursive: true });
+    execFileSync('git', ['-C', p, 'init', '-q'], { stdio: 'pipe' });
+    expect(validateRepoState(p, 'https://github.com/expected/url')).toBe('corrupted');
   });
 
   test("returns 'url-drift' when remote differs from expected", async () => {
@@ -414,5 +441,108 @@ describe('validateRepoState', () => {
     await withEnv({ PATH: fakePath() }, async () => {
       expect(validateRepoState(p)).toBe('healthy');
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1315 — stderr-first git errors + platform-aware no-prompt env.
+//
+// (a) GitOperationError used to wrap Node's execFileSync envelope
+//     ("Command failed: git -C <path> -c http.followRedirects=false …"),
+//     so every downstream `.slice(0, N)` (sync's warn lines) cut the message
+//     off BEFORE the real `fatal: …` stderr. The wrapper now leads with the
+//     captured stderr.
+// (b) GIT_ENV hardcoded the POSIX-only `/bin/false` askpass, which on Windows
+//     makes git fail with a confusing "could not run askpass" instead of
+//     failing auth cleanly. buildGitEnv(platform) is pure so the win32 shape
+//     is testable on POSIX CI.
+// ---------------------------------------------------------------------------
+
+describe('#1315 — buildGitEnv platform shapes', () => {
+  test('POSIX keeps the /bin/false askpass confinement (unchanged)', () => {
+    for (const platform of ['linux', 'darwin'] as const) {
+      const env = buildGitEnv(platform);
+      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+      expect(env.GCM_INTERACTIVE).toBe('never');
+      expect(env.GIT_ASKPASS).toBe('/bin/false');
+      expect(env.SSH_ASKPASS).toBe('/bin/false');
+      expect(env.SSH_ASKPASS_REQUIRE).toBeUndefined();
+    }
+  });
+
+  test('win32 drops the POSIX-only /bin/false and forbids ssh askpass instead', () => {
+    const env = buildGitEnv('win32');
+    expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+    expect(env.GCM_INTERACTIVE).toBe('never');
+    expect(env.GIT_ASKPASS).toBeUndefined();
+    expect(env.SSH_ASKPASS).toBeUndefined();
+    expect(env.SSH_ASKPASS_REQUIRE).toBe('never');
+  });
+
+  test('GIT_ENV is the current-platform build', () => {
+    expect(GIT_ENV).toEqual(buildGitEnv());
+  });
+});
+
+describe('#1315 — stderr-first GitOperationError (real git, file-origin repo)', () => {
+  const SANDBOX = join(tmpdir(), `gbrain-1315-stderr-${process.pid}`);
+
+  beforeAll(() => {
+    rmSync(SANDBOX, { recursive: true, force: true });
+    mkdirSync(SANDBOX, { recursive: true });
+  });
+  afterAll(() => {
+    rmSync(SANDBOX, { recursive: true, force: true });
+  });
+
+  /** Upstream repo + a mirror cloned via plain git (origin = local file path),
+   *  so pullRepo/fetchRemote deterministically fail on protocol.file.allow=never. */
+  function mkFileOriginMirror(): string {
+    const upstream = join(SANDBOX, `upstream-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(upstream, { recursive: true });
+    writeFileSync(join(upstream, 'a.md'), '# a');
+    execFileSync('git', ['-C', upstream, 'init', '-q']);
+    execFileSync('git', ['-C', upstream, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', upstream, 'config', 'user.name', 'Test']);
+    execFileSync('git', ['-C', upstream, 'add', '-A']);
+    execFileSync('git', ['-C', upstream, 'commit', '-q', '-m', 'initial']);
+    const mirror = `${upstream}-mirror`;
+    execFileSync('git', ['clone', '-q', upstream, mirror]);
+    return mirror;
+  }
+
+  // skipIf: pins "git's own fatal: appears within the first 200 chars" —
+  // unrunnable behind an ambient git PATH shim that prints its own stderr
+  // first (e.g. Conductor's auth-broker wrapper). See helpers/git-stderr-probe.
+  test.skipIf(!gitStderrLeads())('pullRepo message leads with the real git stderr, not the Command-failed envelope', () => {
+    const mirror = mkFileOriginMirror();
+    let threw: GitOperationError | undefined;
+    try {
+      pullRepo(mirror);
+    } catch (e) {
+      threw = e as GitOperationError;
+    }
+    expect(threw).toBeInstanceOf(GitOperationError);
+    const msg = threw!.message;
+    expect(msg).toContain('git pull failed in');
+    // The real git error must survive a downstream 200-char warn slice.
+    expect(msg.slice(0, 200)).toMatch(/fatal:/);
+    // The Node envelope (full argv echo) must NOT be the message body.
+    expect(msg).not.toContain('Command failed');
+    // Cause preserved for timeout/code inspection (sync.ts reads .cause).
+    expect(threw!.cause).toBeDefined();
+  });
+
+  test.skipIf(!gitStderrLeads())('fetchRemote message is stderr-first too', () => {
+    const mirror = mkFileOriginMirror();
+    let threw: GitOperationError | undefined;
+    try {
+      fetchRemote(mirror, 'master');
+    } catch (e) {
+      threw = e as GitOperationError;
+    }
+    expect(threw).toBeInstanceOf(GitOperationError);
+    expect(threw!.message.slice(0, 200)).toMatch(/fatal:/);
+    expect(threw!.message).not.toContain('Command failed');
   });
 });

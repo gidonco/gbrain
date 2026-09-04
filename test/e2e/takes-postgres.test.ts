@@ -179,6 +179,9 @@ d('v0.28 takes engine — Postgres', () => {
     const stale = await engine.listStaleTakes();
     expect(stale.length).toBe(count);
     expect(stale[0]).toHaveProperty('take_id');
+    expect(typeof stale[0]!.take_id).toBe('number');
+    expect(typeof stale[0]!.row_num).toBe('number');
+    expect(() => JSON.stringify(stale)).not.toThrow();
   });
 });
 
@@ -213,8 +216,7 @@ d('v0.28 MCP allow-list — Postgres dispatch', () => {
   test('takes_list returns only world holders when allow-list = ["world"]', async () => {
     const engine = getEngine();
     const result = await dispatchToolCall(engine, 'takes_list', { page_slug: 'people/alice-example' }, {
-      remote: true,
-      takesHoldersAllowList: ['world'],
+      remote: true, sourceId: 'default',      takesHoldersAllowList: ['world'],
     });
     expect(result.isError).toBeFalsy();
     const takes = JSON.parse(result.content[0].text);
@@ -236,8 +238,7 @@ d('v0.28 MCP allow-list — Postgres dispatch', () => {
   test('takes_search honors allow-list', async () => {
     const engine = getEngine();
     const result = await dispatchToolCall(engine, 'takes_search', { query: 'technical' }, {
-      remote: true,
-      takesHoldersAllowList: ['world'],
+      remote: true, sourceId: 'default',      takesHoldersAllowList: ['world'],
     });
     const hits = JSON.parse(result.content[0].text) as Array<{ holder: string }>;
     expect(hits.every(h => h.holder === 'world')).toBe(true);
@@ -246,8 +247,7 @@ d('v0.28 MCP allow-list — Postgres dispatch', () => {
   test('think op rejects save/take from remote callers', async () => {
     const engine = getEngine();
     const result = await dispatchToolCall(engine, 'think', { question: 'q', save: true, take: true }, {
-      remote: true,
-    });
+      remote: true, sourceId: 'default',    });
     const env = JSON.parse(result.content[0].text);
     // Remote with save/take → safe path forces them off, runs gather-only
     expect(env.remote_persisted_blocked).toBe(true);
@@ -384,8 +384,7 @@ d('v0.30.0 MCP dispatch — Postgres', () => {
   test('takes_scorecard via MCP returns correct counts with allow-list', async () => {
     const engine = getEngine();
     const result = await dispatchToolCall(engine, 'takes_scorecard', { holder: 'garry' }, {
-      remote: true,
-      takesHoldersAllowList: ['garry'],
+      remote: true, sourceId: 'default',      takesHoldersAllowList: ['garry'],
     });
     expect(result.isError).toBeFalsy();
     const card = JSON.parse(result.content[0].text);
@@ -399,8 +398,7 @@ d('v0.30.0 MCP dispatch — Postgres', () => {
   test('takes_calibration via MCP returns bucket array with allow-list', async () => {
     const engine = getEngine();
     const result = await dispatchToolCall(engine, 'takes_calibration', { holder: 'garry', bucket_size: 0.1 }, {
-      remote: true,
-      takesHoldersAllowList: ['garry'],
+      remote: true, sourceId: 'default',      takesHoldersAllowList: ['garry'],
     });
     expect(result.isError).toBeFalsy();
     const buckets = JSON.parse(result.content[0].text);
@@ -419,8 +417,7 @@ d('v0.30.0 MCP dispatch — Postgres', () => {
     // 'world' has only fact-kind takes in the seed; bets are garry-only.
     // Scorecard scoped to world should report zero resolved.
     const result = await dispatchToolCall(engine, 'takes_scorecard', {}, {
-      remote: true,
-      takesHoldersAllowList: ['world'],
+      remote: true, sourceId: 'default',      takesHoldersAllowList: ['world'],
     });
     const card = JSON.parse(result.content[0].text);
     // No resolved bets exist with holder='world' in our seed.

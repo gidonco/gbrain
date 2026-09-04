@@ -1,7 +1,7 @@
-# Pack-Upgrade Mechanism (v0.41.22)
+# Pack-Upgrade Mechanism
 
 > How `gbrain-base@1.x → gbrain-base-v2@1.0.0` (and any future pack
-> succession) wires through the onboard cathedral.
+> succession) wires through the onboard pipeline.
 
 ## The contract
 
@@ -45,8 +45,7 @@ that tuple lights up the `pack_upgrade_available` onboard check.
 │         → returns ResolvedPack[] sorted by successor version  │
 │    4. If successors.length > 0, emit OnboardCheckResult        │
 │       with RemediationStep targeting `unify-types` handler    │
-│       + protected: true (D17 → manual_only via render          │
-│       allowlist)                                               │
+│       + protected: true (manual_only via render allowlist)     │
 └──────────────────────────┬─────────────────────────────────────┘
                            ↓
 ┌────────────────────────────────────────────────────────────────┐
@@ -56,7 +55,8 @@ that tuple lights up the `pack_upgrade_available` onboard check.
 │  gbrain onboard --check --explain shows per-cluster narrative  │
 │  User reviews; if OK, runs:                                    │
 │    gbrain jobs submit unify-types --allow-protected \          │
-│      --params '{"target_pack":"gbrain-base-v2"}'               │
+│      --params '{"target_pack":"gbrain-base-v2","apply":true}'  │
+│  (omit "apply":true for a dry-run; that is the default)        │
 │  (Autopilot never auto-fires this; manual_only)                │
 └──────────────────────────┬─────────────────────────────────────┘
                            ↓
@@ -68,17 +68,17 @@ that tuple lights up the `pack_upgrade_available` onboard check.
 │  3. Acquire gbrain-unify db-lock (60min TTL)                   │
 │  4. Apply phases (4):                                          │
 │     a. Explicit retype rules (chunked UPDATE 1000/batch)       │
-│        - frontmatter.legacy_type ALWAYS preserved (D8)         │
+│        - frontmatter.legacy_type ALWAYS preserved              │
 │        - frontmatter.subtype stamped when subtype set          │
 │     b. Catch-all retype: synthesize per-unknown-type rule       │
 │        excluding declared types + explicit targets + page_to_  │
-│        link/alias sources (D12 + critical bug fix)             │
+│        link/alias sources                                      │
 │     c. Page-to-link: parse body+frontmatter, insert link row,  │
-│        soft-delete source page (per-page atomicity per F7)     │
+│        soft-delete source page (per-page atomicity)            │
 │     d. Page-to-alias: insert slug_aliases row, soft-delete     │
-│        source page (NO rewriteLinks per D15)                   │
+│        source page (NO rewriteLinks)                           │
 │  5. Final sync: path-prefix typing for residual UNTYPED rows   │
-│  6. ACTIVE-PACK FLIP (D13):                                    │
+│  6. ACTIVE-PACK FLIP:                                          │
 │     - engine.setConfig('schema_pack', target_pack)             │
 │     - saveConfig({...existing, schema_pack: target_pack})      │
 │  7. Verify: re-run stats; warn if ≤ declared + 5 violated      │
@@ -126,10 +126,10 @@ candidate ≠ the active pack name, loads the manifest via
 migration_from.version)`. Returns matching packs sorted by version
 descending.
 
-v0.41.22 covers bundled packs only. v0.43+ TODO: enumerate user-installed
-packs at `~/.gbrain/schema-packs/*/pack.yaml` (defer to v0.43 since the
-filesystem-scan cost needs the cache invalidation strategy from
-`registry.ts`).
+Successor detection covers bundled packs only. Future work: enumerate
+user-installed packs at `~/.gbrain/schema-packs/*/pack.yaml` (deferred
+because the filesystem-scan cost needs the cache invalidation strategy
+from `registry.ts`).
 
 ## The manual_only apply policy
 
@@ -145,7 +145,7 @@ The shipped onboard contract has 3 apply_policy values:
 true` + `job: 'unify-types'`. `toOnboardRecommendation` in
 `src/core/onboard/render.ts` maps this to `manual_only` via the
 `MANUAL_ONLY_PROTECTED_JOBS` allowlist (which also contains
-`extract-takes-from-pages` per v0.41.18 A12+A24).
+`extract-takes-from-pages`).
 
 Rationale: pack upgrades change the brain's taxonomy. Taxonomy is a
 user judgment call — not autopilot's call. Even with `--auto-with-
@@ -172,8 +172,8 @@ migration_from:
   version: "1.x"
 
 page_types:
-  # Inherit gbrain-base-v2's 15 types here (or use extends to merge
-  # automatically once v0.43+ extends-chain composition lands)
+  # Inherit gbrain-base-v2's 15 types here (or declare `extends:
+  # gbrain-base-v2` and let the merge contract in schema-packs.md merge them)
   - { name: person, primitive: entity, path_prefixes: [people/], expert_routing: true }
   - { name: company, primitive: entity, path_prefixes: [companies/], expert_routing: true }
   # ... all 13 other v2 canonicals ...
@@ -212,7 +212,7 @@ targeting your pack.
 TTL). The handler acquires it before any apply phase + releases in
 `finally`. Two simultaneous `gbrain jobs submit unify-types`
 invocations: second one fails fast at lock acquisition with a clear
-error. Same pattern as `gbrain-sync` (v0.22.13 PR #490).
+error. Same pattern as the `gbrain-sync` lock.
 
 ## Audit trail
 
@@ -221,17 +221,17 @@ Every unify run writes to `~/.gbrain/audit/schema-unify-YYYY-Www.jsonl`
 identities (before + after), per-phase counts (would_apply + applied),
 warnings, completion timestamp. Privacy: page slugs are NOT logged in
 bulk (only the per-rule sample_slugs[≤10]); for forensic debugging
-add `GBRAIN_AUDIT_FULL=1` (v0.43+ TODO; not yet wired).
+a `GBRAIN_AUDIT_FULL=1` escape hatch has been proposed but is not yet wired.
 
 ## What's NOT yet supported
 
-- Subprocess sandbox for the publish-gate (v0.43+ TODO)
+- Subprocess sandbox for the publish-gate
 - Per-source pack-upgrade (the handler accepts `sourceId` but
   `findPackSuccessors` doesn't yet pass it through)
 - Cross-brain federated mounts that disagree on canonical packs
-- Automatic rollback (today: manual SQL or `gbrain pages restore`)
-- LLM-assisted mapping_rules codegen from production data (`gbrain
-  schema detect-mappings`; deferred to v0.43+)
+- Automatic rollback (today: manual SQL or `gbrain restore`)
+- LLM-assisted mapping_rules codegen from production data (a proposed
+  `gbrain schema detect-mappings`)
 
 ## Reference
 
@@ -241,6 +241,6 @@ add `GBRAIN_AUDIT_FULL=1` (v0.43+ TODO; not yet wired).
 - Onboard check: `src/core/onboard/checks.ts:checkPackUpgradeAvailable`
 - Render allowlist: `src/core/onboard/render.ts:MANUAL_ONLY_PROTECTED_JOBS`
 - Handler: `src/core/schema-pack/unify-types-handler.ts`
-- Migration: `src/core/migrate.ts:105` (slug_aliases table)
+- Migration: the `slug_aliases` entry in `src/core/migrate.ts`'s `MIGRATIONS` array
 - Type taxonomy doc: `docs/architecture/type-taxonomy.md`
 - Skill: `skills/schema-unify/SKILL.md`

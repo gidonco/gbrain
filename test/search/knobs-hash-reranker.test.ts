@@ -28,6 +28,7 @@ import {
   type ResolvedSearchKnobs,
 } from '../../src/core/search/mode.ts';
 import { resolveHardExcludes } from '../../src/core/search/source-boost.ts';
+import { DEFAULT_RERANKER_MODEL, LEGACY_DEFAULT_RERANKER_MODEL } from '../../src/core/ai/defaults.ts';
 
 /** Build a baseline resolved knob set with all reranker fields filled. */
 function baseKnobs(): ResolvedSearchKnobs {
@@ -44,7 +45,7 @@ function baseKnobs(): ResolvedSearchKnobs {
 }
 
 describe('KNOBS_HASH_VERSION + version invariants', () => {
-  test('version is 12 (…; 9→10 relational recall; 10→11 asymmetric input_type #1400; 11→12 hard-excludes #2825)', () => {
+  test('version is 28 (…; 23→24 negative-offset cache-skip gap #4358 residual; 24→25 keywordOrFallback knob kof= #3617; 25→26 salience/recency + intent_patterns fold #4415; 26→27 adaptive-return gate + intent fold E5b/F11; 27→28 compiledTruthBoost synthetic-row suppression #4256/#3695)', () => {
     // v0.35.0.0: 1→2 to fold reranker fields. v0.35.6.0: 2→3 to fold
     // floor_ratio. v0.36 wave: piggybacks on v=3 with 7 cross-modal knobs
     // (D2) PLUS column + provider context (D8/CDX-2 cross-column isolation).
@@ -64,7 +65,34 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // pre-fix document-side query vectors must not be served.
     // #2825: 11→12 to fold the resolved hard-exclude prefix list (hx=) —
     // cached rows leaked GBRAIN_SEARCH_EXCLUDE'd slugs across processes.
-    expect(KNOBS_HASH_VERSION).toBe(12);
+    // #3430: 13→14 — the compiled_truth boost no longer applies at
+    // detail=medium. Results are cached after fusion, so rows ranked under
+    // the old boost semantics must not be served under the new ones.
+    // FTS language: 14→15 to fold the resolved GBRAIN_FTS_LANGUAGE config
+    // name (fts=). It retokenizes both the trigger-built search_vector and
+    // the query-side tsquery, so rows written under the previous language
+    // must not survive a `reindex-search-vector` language switch.
+    // #3515: 15→16 to fold the effective detail level (det=) — a detail=low
+    // write must not be served to a detail=medium lookup.
+    // WP2/T3: 16→17 degradation-stamp epoch — cache rows now carry
+    // degraded[]/retrieved_count; pre-stamp rows must not claim clean.
+    // #3621: 18→19 ack= (autocut minKeep floor) — the floor changes how many
+    // rows survive the cut, so writes and lookups must agree on it.
+    // D-3002: 19→20 pre-fusion pool floor — innerLimit widens the candidate
+    // pool for identical knobs (no new key part; version-only invalidation).
+    // mw2: 21→22 result-stamp/injection epoch (#1663 exact-lookup injection,
+    // #3995 relational page-1 slot, #3783 keyword_hit, #4220 status).
+    // #4352 follow-up: 22→23 excludePrivate posture fold (xp=) — replaces
+    // the wholesale cache skip that disabled caching for remote callers.
+    // #4358 residual: 23→24 negative-offset cache-skip gap.
+    // 24→25 (#3617): kof= (keyword AND→OR fallback knob) joins the key.
+    // 25→26: sal=/rec=/ipat= — salience/recency + intent_patterns fold (#4415).
+    // 26→27: ar=/arem=/arom=/armk=/ari= — adaptive-return gate + intent
+    // class fold (2026-08 fix wave E5b); adaptive-on calls now cache.
+    // 27→28: compiledTruthBoost suppresses the 2x boost for synthetic
+    // chunkless title rows (#4256, fixes #3695's fusion path) — reorders
+    // fused rows for identical knobs; version-only invalidation.
+    expect(KNOBS_HASH_VERSION).toBe(28);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {
@@ -242,5 +270,17 @@ describe('v=12 hard-exclude participation (#2825)', () => {
     expect(knobsHash(k)).not.toBe(
       knobsHash(k, { hardExcludes: resolveHardExcludes(undefined, undefined, undefined) }),
     );
+  });
+});
+
+describe('v0.48.2 reranker default flip re-keys the cache (rrm= is folded unconditionally)', () => {
+  test('per mode: hash(DEFAULT voyage) !== hash(LEGACY zerank) even with the reranker OFF', () => {
+    expect(DEFAULT_RERANKER_MODEL).toBe('voyage:rerank-2.5');
+    for (const mode of ['conservative', 'balanced', 'tokenmax'] as const) {
+      const base = { ...baseKnobs(), reranker_enabled: MODE_BUNDLES[mode].reranker_enabled };
+      const withDefault = knobsHash({ ...base, reranker_model: DEFAULT_RERANKER_MODEL });
+      const withLegacy = knobsHash({ ...base, reranker_model: LEGACY_DEFAULT_RERANKER_MODEL });
+      expect(withDefault).not.toBe(withLegacy);
+    }
   });
 });
