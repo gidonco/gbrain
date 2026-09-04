@@ -31,6 +31,8 @@ brain_first: exempt
 > output files by primary subject (concepts/ for general strategy, projects/
 > for problem-tied playbooks).
 
+> **Convention:** see [conventions/brain-first.md](../conventions/brain-first.md) for the lookup chain (search → query → get_page → external).
+
 ## What this is
 
 Take a large text PLUS a specific strategic problem, produce analysis that
