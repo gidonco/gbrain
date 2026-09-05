@@ -362,7 +362,7 @@ async function attemptAutopilotSelfUpgrade(
 }
 
 /** Flags that consume the following argv token as their value (#1525). */
-const AUTOPILOT_VALUE_FLAGS = new Set(['--repo', '--interval', '--target']);
+const AUTOPILOT_VALUE_FLAGS = new Set(['--repo', '--interval', '--min-interval', '--target']);
 
 /** Positional spellings → their canonical flags. A Map (not a plain object)
  * so prototype-chain words like `constructor` stay unknown positionals. */
