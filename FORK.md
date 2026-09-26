@@ -1,3 +1,11 @@
+> **ARCHIVED 2026-09-26.** Harry now runs official garrytan/gbrain releases
+> (bun-link clone of upstream at ~/gbrain, upgraded with `gbrain self-upgrade`).
+> The cost guardrails became unnecessary once chat work moved to `claude-cli:`
+> (Claude subscription): the remaining per-token spend is OpenAI embeddings,
+> capped by an OpenAI project budget limit. Scheduling moved to a hand-made
+> 2-hourly LaunchAgent (~/.gbrain/maintenance-run.sh) instead of the upstream
+> autopilot daemon. This repository is kept read-only for reference.
+
 # gidonco/gbrain — fork notes
 
 This fork tracks [garrytan/gbrain](https://github.com/garrytan/gbrain) and carries a small set of
