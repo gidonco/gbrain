@@ -73,13 +73,20 @@ for every release, so it is optional.
 
 ## 3. Cutover
 
-- Autopilot is booted out first, so nothing runs while code changes.
-- The live `~/gbrain` master is fast-forwarded only; there are no merge commits on the live checkout.
-- `gbrain post-upgrade --no-autopilot-install` applies schema migrations against Supabase. It can take a while.
-- `gbrain autopilot --install --repo ~/brain` regenerates the wrapper and plist from the fork build.
-- The live checks then confirm: version matches `package.json`, `ai.daily_budget_usd = 1.50`,
-  `KeepAlive=false`, the wrapper has the 2 h floor, the plist holds no secrets, `doctor` ran, and all invariants hold.
-- **Restart the MCP clients** (Claude Desktop, Claude Code) afterwards. Their `gbrain serve` children keep running the old code until restarted.
+1. **Quiesce.** Boot out autopilot and stop every `gbrain serve`, `jobs work` and `jobs supervisor` process.
+   Hermes, Claude Desktop and Claude Code spawn `gbrain serve` as their MCP server. Then cancel any job still
+   marked `active`: with no workers left, such jobs are orphaned. Some schema migrations refuse to run otherwise,
+   for example v149 `minion_submission_authority`.
+2. **Fast-forward** the live `~/gbrain` master. There are never merge commits on the live checkout.
+   `bun install` runs gbrain's postinstall, which already attempts migrations.
+3. **Migrate.** Run `gbrain post-upgrade --no-autopilot-install`, then `gbrain apply-migrations --yes`.
+   - A **schema** migration failure is fatal: the script stops and autopilot stays down.
+   - A **feature (orchestrator)** migration finishing `PARTIAL` or `WEDGED` is reported but does not block.
+     These need an opt-in host decision. Example: v0.53.0 shared-skills adoption.
+4. **Reinstall autopilot** with `gbrain autopilot --install --repo ~/brain`, then load it.
+5. **Live checks.** The version matches `package.json`, `ai.daily_budget_usd = 1.50`, `KeepAlive=false`,
+   the wrapper has the 2 h floor, the plist holds no secrets, `doctor` ran, and all invariants hold.
+6. **Restart the MCP host apps** (Hermes, Claude Desktop, Claude Code) so they respawn `gbrain serve` on the new code.
 
 ## 4–5. Push and clean up
 
@@ -99,4 +106,4 @@ the matching `~/.gbrain/backups/upgrade-<ts>/` only if it was changed.
 |------|-----------|-----------|-------|
 | 2026-07-18 | 0.42.62.0 | – | Cost guardrails introduced (PR #1). |
 | 2026-09 | 0.42.62.0 → 0.48.2.0 | autopilot `--min-interval` | Merged locally, not pushed until 2026-09-26. |
-| 2026-09-26 | 0.48.2.0 → 0.58.1.0 | CHANGELOG, autopilot.ts, gateway.ts (4), budget-meter.ts (7), flag registry | budget-meter taken from upstream (pessimistic expiry now native). ZeroEntropy pricing test → Voyage. Workflow script + runbook added. |
+| 2026-09-26 | 0.48.2.0 → 0.58.1.0 | CHANGELOG, autopilot.ts, gateway.ts (4), budget-meter.ts (7), flag registry | budget-meter.ts taken from upstream (pessimistic expiry is now native). ZeroEntropy pricing test replaced with Voyage. Wrapper test pinned to the 2 h floor. Schema 145 → 165. v149 was blocked by an orphaned `active` sync job from 2026-09-05 (cancelled), which led to the quiesce step. v0.53.0 shared-skills adoption left PARTIAL (opt-in). Autopilot had been down since 2026-09-05 and was restarted. Workflow script and runbook added. |

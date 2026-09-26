@@ -178,23 +178,57 @@ affected_sweep() {
   (( regress == 0 )) && ok "no fork-caused regressions" || die "$regress fork-caused regression(s) — see $res"
 }
 
+# Stop everything that writes to the brain before migrating. Some migrations
+# (e.g. v149 minion_submission_authority) refuse to run while any job is 'active'
+# or older-code writers are connected.
+quiesce() {
+  say "Quiesce: stop autopilot, old 'gbrain serve' MCP servers, orphaned jobs"
+  launchctl bootout "gui/$(id -u)/com.gbrain.autopilot" 2>/dev/null || true
+  sleep 2
+  local p pp
+  for p in $(pgrep -f 'gbrain (serve|autopilot|jobs work|jobs supervisor)' || true); do
+    pp=$(ps -o ppid= -p "$p" | tr -d ' ')
+    warn "stopping pid $p ($(ps -o command= -p "$p" | cut -c1-60)) — parent: $(ps -o comm= -p "$pp" 2>/dev/null)"
+    kill "$p" 2>/dev/null || true
+  done
+  sleep 3
+  pgrep -f 'gbrain serve' >/dev/null && die "gbrain serve still running; stop its host app (Hermes / Claude Desktop / Claude Code) and retry"
+  # With every worker stopped, any job still marked 'active' is orphaned.
+  local ids
+  ids=$(gb jobs list --status active --json | python3 -c 'import json,sys
+try: print(" ".join(str(j["id"]) for j in json.load(sys.stdin)))
+except Exception: pass')
+  for p in $ids; do warn "cancelling orphaned active job #$p"; gb jobs cancel "$p" >/dev/null || true; done
+  ok "quiesced"
+}
+
 cmd_cutover() {
   preflight
   [[ -d "$WT" ]] || die "no worktree at $WT"
   local branch; branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD)
   git -C "$LIVE" merge-base --is-ancestor master "$branch" || die "$branch does not descend from master"
   mkdir -p "$LOGDIR"
-  say "Stop autopilot (if loaded)"
-  launchctl bootout "gui/$(id -u)/com.gbrain.autopilot" 2>/dev/null || true
+  quiesce
   say "Fast-forward $LIVE master -> $branch"
   git -C "$LIVE" merge --ff-only -q "$branch"
-  (cd "$LIVE" && bun install >/dev/null)
+  # bun install runs gbrain's postinstall, which already attempts schema migrations.
+  (cd "$LIVE" && bun install >"$LOGDIR/bun-install.log" 2>&1) || die "bun install failed (see $LOGDIR/bun-install.log)"
   local v; v=$(installed_version); local want; want=$(grep -Eo '"version": *"[^"]+"' "$LIVE/package.json" | grep -Eo '[0-9.]+[0-9]')
   [[ "$v" == "$want" ]] && ok "gbrain --version = $v" || die "gbrain reports $v, package.json says $want"
   say "post-upgrade (migrations; log: $LOGDIR/post-upgrade.log)"
-  gbrain post-upgrade --no-autopilot-install >"$LOGDIR/post-upgrade.log" 2>&1 || warn "post-upgrade reported problems — see log; retry: gbrain apply-migrations --yes"
+  gbrain post-upgrade --no-autopilot-install >"$LOGDIR/post-upgrade.log" 2>&1 || true
+  gbrain apply-migrations --yes >"$LOGDIR/apply-migrations.log" 2>&1 || true
+  # Schema migrations are mandatory: autopilot must never run new code on a half-migrated schema.
+  if grep -q 'Schema migration failed' "$LOGDIR/apply-migrations.log"; then
+    grep 'Schema migration failed' "$LOGDIR/apply-migrations.log" | tail -1 >&2
+    die "schema migration failed — autopilot left STOPPED. Fix the cause, run 'gbrain apply-migrations --yes', then '$0 check' and 'launchctl bootstrap gui/$(id -u) $PLIST'"
+  fi
+  ok "schema migrations applied"
+  # Orchestrator (feature) migrations may finish PARTIAL when they need an opt-in host decision; not a blocker.
+  grep -hE 'finished as PARTIAL|WEDGED' "$LOGDIR/post-upgrade.log" "$LOGDIR/apply-migrations.log" 2>/dev/null | sort -u | sed 's/^/     note: /' || true
   say "Reinstall autopilot from the fork build"
   gbrain autopilot --install --repo "$BRAIN_REPO" >"$LOGDIR/autopilot-install.log" 2>&1 || die "autopilot --install failed (see log)"
+  launchctl list | grep -q com.gbrain.autopilot || launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || true
   cmd_live_checks
 }
 
@@ -211,8 +245,8 @@ cmd_live_checks() {
   launchctl list | grep -q com.gbrain.autopilot && ok "autopilot loaded" || warn "autopilot not loaded (load: launchctl bootstrap gui/$(id -u) $PLIST)"
   gb doctor --json >"$LOGDIR/doctor.json" 2>/dev/null && ok "doctor ran (report: $LOGDIR/doctor.json)" || warn "doctor returned non-zero — review $LOGDIR/doctor.json"
   FAILS_LIVE=$FAILS; invariants "$LIVE"; FAILS=$((FAILS+FAILS_LIVE))
-  if pgrep -f 'gbrain serve' >/dev/null; then
-    warn "running 'gbrain serve' processes still use the OLD code — restart the MCP clients (Claude Desktop/Code) to pick up the new version"
+  if ! pgrep -f 'gbrain serve' >/dev/null; then
+    warn "no 'gbrain serve' running — restart the MCP host apps (Hermes, Claude Desktop, Claude Code) so they respawn it on the new code"
   fi
   (( FAILS == 0 )) && say "Cutover verified. Next: $0 push && $0 cleanup" || die "$FAILS live check(s) failed"
 }
