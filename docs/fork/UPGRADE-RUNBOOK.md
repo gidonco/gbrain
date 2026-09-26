@@ -9,7 +9,8 @@ upstream release of `garrytan/gbrain` while keeping the fork patches listed in [
 scripts/fork/upgrade.sh status        # 0. what's installed / available / are the patches intact
 scripts/fork/upgrade.sh prepare       # 1. backup + worktree + merge latest upstream tag
                                       #    (exit 2 = conflicts → resolve with the playbook below)
-scripts/fork/upgrade.sh verify        # 2. install, flag registry, typecheck, guardrail tests, invariants
+scripts/fork/upgrade.sh verify --affected  # 2. install, flag registry, typecheck, guardrail tests, invariants,
+                                           #    + isolated affected-area sweep diffed against pristine upstream
 scripts/fork/upgrade.sh cutover       # 3. ff live checkout, migrations, autopilot reinstall, live checks
 #   → restart Claude Desktop / Claude Code so their `gbrain serve` MCP processes load the new code
 scripts/fork/upgrade.sh push          # 4. sync gidonco/gbrain on GitHub
@@ -60,13 +61,15 @@ After resolving: `git -C ~/gbrain-upgrade add -A && git -C ~/gbrain-upgrade comm
 4. The guardrail test set is green: daily-budget gateway tests, budget-meter, budget-tracker, autopilot, flag validation, OCR budget, config-set.
 5. Every **fork patch invariant** holds (grep-level proof that each patch survived the merge).
 
-Optional: `verify --full` runs the whole unit suite (~1,900 files; takes hours on a Mac). Upstream CI already
-runs it on every release, so the default gate covers only what the fork changes. For extra coverage
-without the hours, run the affected-area sweep:
+6. With `--affected` (recommended; ~15–30 min): every test file touching gateway / autopilot / budget /
+   expansion / OCR / rerank / embed is run **in its own process**. A failing file is re-run against a pristine
+   checkout of the upstream tag (`~/gbrain-baseline`), and only *fork-caused* regressions fail the gate
+   (baseline green, fork red). Files that are red upstream too are listed as `upstream-red` for information.
+   Don't run many test files in one `bun test a b c …` process: they share module state and PGLite
+   directories, and the result is dozens of false failures.
 
-```
-setopt extendedglob; bun test $(ls test/**/*(gateway|autopilot|budget|expansion|ocr|rerank|embed)*.test.ts | grep -v '\.e2e\.')
-```
+`verify --full` runs the whole unit suite (~1,900 files; hours on a Mac). Upstream CI already runs it
+for every release, so it is optional.
 
 ## 3. Cutover
 

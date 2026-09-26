@@ -7,7 +7,10 @@
 #
 #   scripts/fork/upgrade.sh status             what's installed, what's available
 #   scripts/fork/upgrade.sh prepare [TAG]      backup + worktree + merge (default: latest upstream tag)
-#   scripts/fork/upgrade.sh verify [--full]    install, typecheck, guardrail tests, patch invariants
+#   scripts/fork/upgrade.sh verify [--affected|--full]
+#                                              install, typecheck, guardrail tests, patch invariants
+#                                              --affected: + every gateway/autopilot/budget/embed test file,
+#                                              isolated, diffed against pristine upstream (recommended)
 #   scripts/fork/upgrade.sh cutover            ff live checkout, migrations, autopilot reinstall, live checks
 #   scripts/fork/upgrade.sh push               push master + backup tags to origin (gidonco/gbrain)
 #   scripts/fork/upgrade.sh cleanup            remove the upgrade worktree/branch
@@ -135,15 +138,44 @@ cmd_verify() {
     test/minions/budget-meter.test.ts test/budget-meter.test.ts test/budget-tracker.test.ts \
     test/core/budget test/autopilot-reconnect-classifier.test.ts test/autopilot-self-upgrade.test.ts \
     test/cli-flag-validation.test.ts test/ocr-run-budget.test.ts test/config-set.test.ts \
+    test/autopilot-install-wrapper.serial.test.ts \
     >"$LOGDIR/guardrail-tests.log" 2>&1 || { grep -E '^\(fail\)' "$LOGDIR/guardrail-tests.log" | sort -u; die "guardrail tests failed (see $LOGDIR/guardrail-tests.log)"; }
   ok "$(grep -E '^ *[0-9]+ pass' "$LOGDIR/guardrail-tests.log" | tr -s ' ')"
   FAILS=0; invariants "$WT"; (( FAILS == 0 )) || die "$FAILS fork patch invariant(s) failed"
+  if [[ "${1:-}" == "--affected" ]]; then affected_sweep; fi
   if [[ "${1:-}" == "--full" ]]; then
     say "full unit suite (slow; log: $LOGDIR/unit.log)"
     bun run test >"$LOGDIR/unit.log" 2>&1 || { tail -40 "$LOGDIR/unit.log"; die "unit suite failed"; }
     ok "unit suite green"
   fi
   say "Verified. Next: $0 cutover"
+}
+
+# Every test file touching the fork's areas, each in its OWN bun process (files
+# share module state and PGLite dirs, so a single `bun test a b c` run produces
+# false failures). A failing file is re-run against a pristine upstream checkout
+# of the merged tag; only fork-caused regressions (baseline green, fork red) fail.
+affected_sweep() {
+  local tag; tag=$(git -C "$WT" rev-parse --abbrev-ref HEAD); tag=${tag#upgrade/}
+  git -C "$WT" rev-parse -q --verify "$tag^{commit}" >/dev/null || die "cannot derive upstream tag from branch name ($tag)"
+  local base="$HOME/gbrain-baseline"
+  local list="$LOGDIR/affected-files.txt" res="$LOGDIR/affected-results.txt"
+  (cd "$WT" && find test -type f -name '*.test.ts' ! -name '*.e2e.*' \
+     | grep -E 'gateway|autopilot|budget|expansion|ocr|rerank|embed' | sort) >"$list"
+  say "affected sweep: $(wc -l <"$list" | tr -d ' ') files, one process each (log: $res)"
+  : >"$res"; local regress=0 f
+  while read -r f; do
+    if (cd "$WT" && timeout 900 bun test "$f" >/dev/null 2>&1); then echo "ok   $f" >>"$res"; continue; fi
+    if [[ ! -d "$base" ]]; then git -C "$LIVE" worktree add -q --detach "$base" "$tag"; (cd "$base" && bun install >/dev/null 2>&1); fi
+    git -C "$base" checkout -q --detach "$tag"
+    if (cd "$base" && timeout 900 bun test "$f" >/dev/null 2>&1); then
+      echo "REGRESSION $f" >>"$res"; regress=$((regress+1))
+    else
+      echo "upstream-red $f" >>"$res"
+    fi
+  done <"$list"
+  grep -v '^ok ' "$res" | sed 's/^/     /' || true
+  (( regress == 0 )) && ok "no fork-caused regressions" || die "$regress fork-caused regression(s) — see $res"
 }
 
 cmd_cutover() {
@@ -197,7 +229,8 @@ cmd_cleanup() {
   git -C "$LIVE" merge-base --is-ancestor "$branch" master || die "$branch is not merged into master; refusing to remove"
   git -C "$LIVE" worktree remove "$WT"
   git -C "$LIVE" branch -d "$branch"
-  say "removed $WT and $branch"
+  [[ -d "$HOME/gbrain-baseline" ]] && git -C "$LIVE" worktree remove --force "$HOME/gbrain-baseline"
+  say "removed $WT, $branch and the baseline worktree"
 }
 
 cmd_rollback() {
@@ -222,5 +255,5 @@ case "${1:-}" in
   push)     shift; cmd_push "$@";;
   cleanup)  shift; cmd_cleanup "$@";;
   rollback) shift; cmd_rollback "$@";;
-  *) sed -n '2,20p' "$0"; exit 64;;
+  *) sed -n '2,23p' "$0"; exit 64;;
 esac

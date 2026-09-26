@@ -132,7 +132,8 @@ describe('#4728 wrapper falls back when the baked CLI path is gone', () => {
       const src = readFileSync(rig.wrapperPath, 'utf8');
       const lines = src.trimEnd().split('\n');
       const last = lines[lines.length - 1];
-      expect(last).toMatch(/^exec '.*' autopilot --repo '.*'$/);
+      // Fork guardrail: the installed wrapper pins the 2h floor on the exec line.
+      expect(last).toMatch(/^exec '.*' autopilot --repo '.*' --interval 7200 --min-interval 7200$/);
       // indexOf("exec '") (used by the #2608 truncation harness and the
       // launchd-lifecycle ordering pins) must still land on that FINAL line,
       // not on the fallback.
