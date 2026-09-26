@@ -1,3 +1,10 @@
+import { SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL } from './company-brain/receipt-schema.ts';
+import { PERSISTENCE_SCHEMA_STATEMENTS } from './persistence/schema.ts';
+import { PERSISTENCE_TOPOLOGY_SCHEMA_SQL } from './persistence/topology-schema.ts';
+import { PAGE_PROJECTION_SCHEMA_SQL } from './page-state/projection-schema.ts';
+import { LEASE_TOKEN_SCHEMA_SQL } from './lease-schema.ts';
+import { PAGE_STATE_SCHEMA_SQL } from './page-state/schema.ts';
+import { SHARED_SKILLS_SCHEMA_SQL } from './shared-skills/schema-all.ts';
 /**
  * PGLite schema — derived from schema-embedded.ts (Postgres schema).
  *
@@ -21,6 +28,8 @@
  * test/edge-bundle.test.ts has a drift detection test.
  */
 
+import { GRANT_AUDIT_SCHEMA_SQL } from './grants/schema.ts';
+import { FACT_WITHDRAWAL_SCHEMA_STATEMENTS } from './facts/withdrawal-schema.ts';
 import { applyChunkEmbeddingIndexPolicy } from './vector-index.ts';
 import { applyFtsLanguagePolicy } from './fts-language.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
@@ -56,8 +65,10 @@ CREATE TABLE IF NOT EXISTS sources (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Avoid firing managed BEFORE INSERT guards for an existing seed on restart.
 INSERT INTO sources (id, name, config)
-  VALUES ('default', 'default', '{"federated": true}'::jsonb)
+  SELECT 'default', 'default', '{"federated": true}'::jsonb
+  WHERE NOT EXISTS (SELECT 1 FROM sources WHERE id = 'default')
   ON CONFLICT (id) DO NOTHING;
 
 -- v0.40 Federated Sync v2: partial expression index on config->>'github_repo'
@@ -446,6 +457,8 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   queue            TEXT        NOT NULL DEFAULT 'default',
   status           TEXT        NOT NULL DEFAULT 'waiting',
   priority         INTEGER     NOT NULL DEFAULT 0,
+  submission_authority JSONB, -- Unreviewed legacy provenance stays NULL.
+  claim_generation BIGINT NOT NULL DEFAULT 0,
   data             JSONB       NOT NULL DEFAULT '{}',
   max_attempts     INTEGER     NOT NULL DEFAULT 3,
   attempts_made    INTEGER     NOT NULL DEFAULT 0,
@@ -493,6 +506,26 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   CONSTRAINT chk_timeout_positive CHECK (timeout_ms IS NULL OR timeout_ms > 0),
   CONSTRAINT chk_lock_duration_positive CHECK (lock_duration_ms IS NULL OR (lock_duration_ms >= 5000 AND lock_duration_ms <= 3600000))
 );
+
+CREATE OR REPLACE FUNCTION enforce_minion_queue_protocol() RETURNS trigger SET search_path = pg_catalog, public AS $protocol$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.submission_authority IS NULL OR NEW.claim_generation <> 0 THEN
+      RAISE EXCEPTION 'Minion queue protocol 1 required: upgrade every producer and worker before restart';
+    END IF;
+  ELSIF NEW.status = 'active' AND (OLD.status <> 'active' OR NEW.lock_token IS DISTINCT FROM OLD.lock_token) THEN
+    IF NEW.submission_authority IS NULL OR NEW.claim_generation IS DISTINCT FROM OLD.claim_generation + 1 THEN
+      RAISE EXCEPTION 'Minion queue protocol 1 required: old workers cannot claim upgraded queue jobs';
+    END IF;
+  ELSIF NEW.claim_generation IS DISTINCT FROM OLD.claim_generation THEN
+    RAISE EXCEPTION 'Minion queue claim generation may advance only with a claim';
+  END IF;
+  RETURN NEW;
+END;
+$protocol$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS minion_queue_protocol ON minion_jobs;
+CREATE TRIGGER minion_queue_protocol BEFORE INSERT OR UPDATE ON minion_jobs
+  FOR EACH ROW EXECUTE FUNCTION enforce_minion_queue_protocol();
 
 CREATE INDEX IF NOT EXISTS idx_minion_jobs_claim ON minion_jobs (queue, priority ASC, created_at ASC) WHERE status = 'waiting';
 CREATE INDEX IF NOT EXISTS idx_minion_jobs_status ON minion_jobs(status);
@@ -632,6 +665,7 @@ CREATE TABLE IF NOT EXISTS gbrain_cycle_locks (
   last_refreshed_at  TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_cycle_locks_ttl ON gbrain_cycle_locks(ttl_expires_at);
+${LEASE_TOKEN_SCHEMA_SQL}
 
 -- Eval capture (v0.25.0). PGLite ignores RLS — see src/schema.sql for the
 -- cross-engine spec.
@@ -927,6 +961,12 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   -- tier names into surface); NULL = server/config surface resolution.
   surface                 TEXT NULL,
   surface_set_by          TEXT NULL,
+  allowed_operations      TEXT[] NULL,
+  delegated_slug_prefixes TEXT[] NULL,
+  delegated_namespace    TEXT NOT NULL DEFAULT 'prefixes',
+  grant_profile           TEXT NULL,
+  grant_revision          INTEGER NOT NULL DEFAULT 0,
+  grant_repair_reasons    TEXT[] NOT NULL DEFAULT '{}',
   created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 -- v0.34.1 (#861, D13 + #876): source_id is the OAuth client's write-source
@@ -938,6 +978,9 @@ CREATE INDEX IF NOT EXISTS idx_oauth_clients_source_id
   ON oauth_clients(source_id) WHERE source_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_read
   ON oauth_clients USING GIN (federated_read);
+
+${GRANT_AUDIT_SCHEMA_SQL}
+${FACT_WITHDRAWAL_SCHEMA_STATEMENTS[0]};
 
 CREATE TABLE IF NOT EXISTS oauth_tokens (
   token_hash   TEXT PRIMARY KEY,
@@ -1034,6 +1077,25 @@ CREATE TABLE IF NOT EXISTS session_context_state (
 );
 CREATE INDEX IF NOT EXISTS session_context_state_updated_idx
   ON session_context_state (updated_at);
+
+-- extract_atoms_transcript_state (migration v146 — #4148 follow-on).
+-- Failure streak + tombstone for TRANSCRIPT extraction items, which are files
+-- and so have no page frontmatter to carry it. See src/schema.sql for the full
+-- rationale (why not raw_data, why not dream_verdicts columns, why source_id is
+-- in the key). content_hash is the 16-char prefix, matching
+-- atoms.frontmatter->>'source_hash'.
+CREATE TABLE IF NOT EXISTS extract_atoms_transcript_state (
+  source_id    TEXT        NOT NULL DEFAULT 'default',
+  file_path    TEXT        NOT NULL,
+  content_hash TEXT        NOT NULL,
+  fail_count   INTEGER     NOT NULL DEFAULT 0,
+  tombstoned   BOOLEAN     NOT NULL DEFAULT FALSE,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, file_path, content_hash)
+);
+CREATE INDEX IF NOT EXISTS extract_atoms_transcript_state_tombstoned_idx
+  ON extract_atoms_transcript_state (source_id, content_hash)
+  WHERE tombstoned;
 
 -- chat_usage_log (#4218 / migration v140). See src/schema.sql for rationale.
 CREATE TABLE IF NOT EXISTS chat_usage_log (
@@ -1152,7 +1214,7 @@ $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_pages_search_vector ON pages;
 CREATE TRIGGER trg_pages_search_vector
-  BEFORE INSERT OR UPDATE ON pages
+  BEFORE INSERT OR UPDATE OF title,timeline ON pages
   FOR EACH ROW
   EXECUTE FUNCTION update_page_search_vector();
 
@@ -1199,16 +1261,28 @@ CREATE INDEX IF NOT EXISTS page_aliases_lookup_idx
   ON page_aliases (source_id, alias_norm);
 CREATE INDEX IF NOT EXISTS page_aliases_slug_idx
   ON page_aliases (source_id, slug);
+${PAGE_STATE_SCHEMA_SQL}
+${PERSISTENCE_SCHEMA_STATEMENTS.join(';\n')};
+${PAGE_PROJECTION_SCHEMA_SQL}
+${PERSISTENCE_TOPOLOGY_SCHEMA_SQL}
+${SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL}
+${SHARED_SKILLS_SCHEMA_SQL}
+
+CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
+  source_incarnation UUID NOT NULL REFERENCES sources(incarnation) ON DELETE CASCADE,
+  page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  content_hash TEXT NOT NULL,
+  fail_count INTEGER NOT NULL DEFAULT 0 CHECK (fail_count >= 0),
+  tombstoned BOOLEAN NOT NULL DEFAULT false,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_incarnation, page_id, content_hash)
+);
+CREATE INDEX IF NOT EXISTS extract_atoms_page_state_tombstoned_idx
+  ON extract_atoms_page_state (source_incarnation, content_hash, page_id) WHERE tombstoned;
+CREATE INDEX IF NOT EXISTS extract_atoms_page_state_page_idx ON extract_atoms_page_state (page_id);
+
 `;
 
-/**
- * Return the PGLite schema SQL with embedding vector dim + model name substituted.
- * Defaults come from the AI gateway (v0.36+: zeroentropyai:zembed-1 / 1280d).
- *
- * v0.37.x fix wave: defaults track gateway constants instead of stale v0.13
- * OpenAI literals so the pre-computed `PGLITE_SCHEMA_SQL` constant doesn't
- * size the column to 1536 while the runtime default model emits 1280.
- */
 export function getPGLiteSchema(
   dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
   model: string = DEFAULT_EMBEDDING_MODEL,

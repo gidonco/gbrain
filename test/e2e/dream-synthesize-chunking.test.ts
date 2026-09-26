@@ -18,7 +18,8 @@
  * Run: bun test test/e2e/dream-synthesize-chunking.test.ts
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, expect } from 'bun:test';
+import { keylessDreamTest as test } from '../helpers/keyless-dream-test.ts';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -207,9 +208,9 @@ describe('E2E synthesize chunking — D8 legacy-key migration', () => {
       const legacyKey = `dream:synth:${oldFilePath}:${contentHash.slice(0, 16)}`;
       await rig.engine.executeRaw(
         `INSERT INTO minion_jobs
-           (name, queue, status, data, result, idempotency_key, finished_at)
+           (submission_authority, name, queue, status, data, result, idempotency_key, finished_at)
          VALUES
-           ('subagent', 'default', 'completed', '{}'::jsonb,
+           ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'default', 'completed', '{}'::jsonb,
             '{"stop_reason":"end_turn"}'::jsonb, $1, now())`,
         [legacyKey],
       );
@@ -271,9 +272,9 @@ describe('E2E synthesize chunking — D8 legacy-key migration', () => {
       for (const key of legacyKeys) {
         await rig.engine.executeRaw(
           `INSERT INTO minion_jobs
-             (name, queue, status, data, result, idempotency_key, finished_at)
+             (submission_authority, name, queue, status, data, result, idempotency_key, finished_at)
            VALUES
-             ('subagent', 'default', 'completed', '{}'::jsonb,
+             ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'default', 'completed', '{}'::jsonb,
               '{"stop_reason":"end_turn"}'::jsonb, $1, now())`,
           [key],
         );
@@ -328,9 +329,9 @@ describe('E2E synthesize chunking — D8 legacy-key migration', () => {
       const legacyKey = `dream:synth:${filePath}:${contentHash.slice(0, 16)}`;
       await rig.engine.executeRaw(
         `INSERT INTO minion_jobs
-           (name, queue, status, data, result, idempotency_key, finished_at)
+           (submission_authority, name, queue, status, data, result, idempotency_key, finished_at)
          VALUES
-           ('subagent', 'default', 'completed', '{}'::jsonb,
+           ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'default', 'completed', '{}'::jsonb,
             to_jsonb('{"stop_reason":"end_turn"}'::text), $1, now())`,
         [legacyKey],
       );
@@ -559,8 +560,8 @@ describe('E2E synthesize — fan-out self-heal for stranded coalesced rows (#415
       // (Nov 2023) is far past the CX1 liveness grace, so the self-heal may
       // legally cancel it.
       const stranded = await rig.engine.executeRaw<{ id: number }>(
-        `INSERT INTO minion_jobs (name, queue, status, data, idempotency_key)
-         VALUES ('subagent', 'dream-inline-1700000000000-deadbeef', 'waiting', '{}'::jsonb, $1)
+        `INSERT INTO minion_jobs (submission_authority, name, queue, status, data, idempotency_key)
+         VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', 'dream-inline-1700000000000-deadbeef', 'waiting', '{}'::jsonb, $1)
          RETURNING id`,
         [key],
       );
@@ -619,8 +620,8 @@ describe('E2E synthesize — fan-out self-heal for stranded coalesced rows (#415
       // concurrently running cycle. The self-heal must leave it alone.
       const liveQueue = `dream-inline-${Date.now()}-0abc1234`;
       const seeded = await rig.engine.executeRaw<{ id: number }>(
-        `INSERT INTO minion_jobs (name, queue, status, data, idempotency_key)
-         VALUES ('subagent', $2, 'waiting', '{}'::jsonb, $1)
+        `INSERT INTO minion_jobs (submission_authority, name, queue, status, data, idempotency_key)
+         VALUES ('{"version":1,"kind":"application"}'::jsonb, 'subagent', $2, 'waiting', '{}'::jsonb, $1)
          RETURNING id`,
         [key, liveQueue],
       );

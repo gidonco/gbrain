@@ -23,6 +23,8 @@
  *   15. Determinism across 10 calls
  *   16. Self-link guard (D13)
  *   17. Cross-source guard
+ *   17b. Cross-source guard lifts under allowCrossSource
+ *   17c. Own-source same-name twin outranks the cross-source twin
  *   18. Hardcoded type filter (meeting NOT in gazetteer)
  *   19. Min-length + ignore-list interaction
  *   20. Code-block + token interaction
@@ -242,6 +244,67 @@ describe('findMentionedEntities — pure cases', () => {
       fromSlug: 'writing/post-1', fromSourceId: 'team-a', // different source
     });
     expect(mentions).toEqual([]);
+  });
+
+  test('17b. cross-source guard lifts under allowCrossSource — mention carries the entity\'s own source_id', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'companies/acme', source_id: 'team-b', title: 'Acme' },
+    ]);
+    const opts = { fromSlug: 'writing/post-1', fromSourceId: 'team-a' };
+    expect(findMentionedEntities('We met Acme today.', g, opts)).toEqual([]);
+    const mentions = findMentionedEntities('We met Acme today.', g, { ...opts, allowCrossSource: true });
+    expect(mentions).toHaveLength(1);
+    expect(mentions[0]!.slug).toBe('companies/acme');
+    expect(mentions[0]!.source_id).toBe('team-b');
+  });
+
+  test('17c. same-name twin in the scanning page\'s own source outranks the cross-source twin', () => {
+    // Bucket order is length-only, so the foreign twin sits first: without the
+    // own-source preference the guard drops the mention (allowCrossSource off)
+    // or links the foreign page (allowCrossSource on).
+    const g = gazetteerFromEntries([
+      { slug: 'companies/acme', source_id: 'team-b', title: 'Acme' },
+      { slug: 'companies/acme-local', source_id: 'team-a', title: 'Acme' },
+    ]);
+    for (const allowCrossSource of [false, true]) {
+      const mentions = findMentionedEntities('We met Acme today.', g, {
+        fromSlug: 'writing/post-1', fromSourceId: 'team-a', allowCrossSource,
+      });
+      expect(mentions).toHaveLength(1);
+      expect(mentions[0]!.slug).toBe('companies/acme-local');
+      expect(mentions[0]!.source_id).toBe('team-a');
+    }
+  });
+
+  // Slug uniqueness is (source_id, slug): with the cross-source guard lifted,
+  // a foreign page that merely shares the scanning page's slug is a real
+  // target, not a self-link.
+  test('17d. allowCrossSource — foreign namesakes of the scanning page are not self-links', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'entities/shared', source_id: 'team-b', title: 'Beta Entity' },
+      { slug: 'entities/shared', source_id: 'team-c', title: 'Gamma Entity' },
+    ]);
+    const mentions = findMentionedEntities('Beta Entity met Gamma Entity.', g, {
+      fromSlug: 'entities/shared', fromSourceId: 'team-a', allowCrossSource: true,
+    });
+    expect(mentions.map(({ source_id, slug }) => [source_id, slug])).toEqual([
+      ['team-b', 'entities/shared'],
+      ['team-c', 'entities/shared'],
+    ]);
+  });
+
+  test('17e. allowCrossSource — first-mention dedup keys on (source_id, slug), not bare slug', () => {
+    const g = gazetteerFromEntries([
+      { slug: 'entities/shared', source_id: 'team-b', title: 'Beta Entity' },
+      { slug: 'entities/shared', source_id: 'team-c', title: 'Gamma Entity' },
+    ]);
+    const mentions = findMentionedEntities('Beta Entity met Gamma Entity.', g, {
+      fromSlug: 'writing/post-1', fromSourceId: 'team-a', allowCrossSource: true,
+    });
+    expect(mentions.map(({ source_id, slug }) => [source_id, slug])).toEqual([
+      ['team-b', 'entities/shared'],
+      ['team-c', 'entities/shared'],
+    ]);
   });
 
   test('20. code-block + token interaction — body text outside block linked, inside skipped', () => {

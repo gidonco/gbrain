@@ -16,6 +16,8 @@ import { loadCompletedMigrations } from '../../core/preferences.ts';
 import { compareVersions } from '../migrations/index.ts';
 import { resolveHoursEnv } from '../../core/env-number.ts';
 import { schemaVersionHealth } from '../../core/schema-version-health.ts';
+import { checkProjectionReadiness } from './checks/projection-readiness.ts';
+import { resolveExcludePrivatePages } from '../../core/search/private-visibility.ts';
 import {
   type Check,
   type DoctorReport,
@@ -66,14 +68,16 @@ const _resolveSyncFreshnessHours = resolveHoursEnv;
 
 export async function doctorReportRemote(
   engine: BrainEngine,
-  opts: { sourceIds?: string[] } = {},
+  opts: { sourceIds?: string[]; remote?: boolean } = {},
 ): Promise<DoctorReport> {
   const checks: Check[] = [];
 
-  // 1. Connection
+  // 1. Connection. #4592: confined to the caller's source scope (undefined =
+  // brain-wide, the local/unscoped path) — an admin-scope aggregate on the
+  // remote trust boundary leaks an excluded source's size by subtraction.
   let pageCount = 0;
   try {
-    const stats = await engine.getStats();
+    const stats = await engine.getStats({ sourceIds: opts.sourceIds });
     pageCount = stats.page_count ?? 0;
     checks.push({
       name: 'connection',
@@ -153,8 +157,10 @@ export async function doctorReportRemote(
   // When the arbiter is missing, EVERY putPage fails with "no unique or
   // exclusion constraint" and the version counter can't see it.
   {
-    const { pagesUpsertArbiterCheck } = await import('./checks/core-health.ts');
+    const { pagesUpsertArbiterCheck, linkSourceCheckConstraintCheck } = await import('./checks/core-health.ts');
     checks.push(await pagesUpsertArbiterCheck(engine));
+    // 2d. #4613: links_link_source_check shape — same drift class as 2b/2c.
+    checks.push(await linkSourceCheckConstraintCheck(engine));
   }
 
   // v0.42.x — Life Chronicle (#2390): orphaned event projections. Reads already
@@ -163,10 +169,13 @@ export async function doctorReportRemote(
   // schema (event_page_id), NOT a migration verify-hook, per
   // migration-verify-hook-never-runs-on-stamped-brains.
   try {
+    // Source isolation: a scoped caller counts only its own sources' projections.
     const orphans = await engine.executeRaw<{ n: number }>(
       `SELECT count(*)::int AS n FROM timeline_entries te
        JOIN pages ep ON ep.id = te.event_page_id
-       WHERE te.event_page_id IS NOT NULL AND ep.deleted_at IS NOT NULL`,
+       WHERE te.event_page_id IS NOT NULL AND ep.deleted_at IS NOT NULL
+         ${opts.sourceIds ? 'AND ep.source_id = ANY($1::text[])' : ''}`,
+      opts.sourceIds ? [opts.sourceIds] : undefined,
     );
     const n = Number(orphans[0]?.n ?? 0);
     checks.push(
@@ -184,9 +193,9 @@ export async function doctorReportRemote(
     checks.push({ name: 'chronicle_projection_health', status: 'ok', message: 'no event projections yet' });
   }
 
-  // 3. Brain score
+  // 3. Brain score (#4592: same scope as the connection count above)
   try {
-    const health = await engine.getHealth();
+    const health = await engine.getHealth({ sourceIds: opts.sourceIds });
     const score = health.brain_score ?? 0;
     checks.push({
       name: 'brain_score',
@@ -253,19 +262,11 @@ export async function doctorReportRemote(
   // trust boundary. Escalates to FAIL when a stuck bookmark has blocked past the
   // sync-freshness fail cadence or unresolved count is large.
   try {
-    const { loadSyncFailures, decideSyncFailureSeverity } = await import('../../core/sync.ts');
-    const entries = loadSyncFailures();
-    const failHours = _resolveSyncFreshnessHours('GBRAIN_SYNC_FRESHNESS_FAIL_HOURS', 72);
-    const sev = decideSyncFailureSeverity({ entries, nowMs: Date.now(), failHours });
-    const msg =
-      sev.unresolved === 0
-        ? 'No unresolved sync failures'
-        : `${sev.unresolved} unresolved sync failure(s)` +
-          (sev.auto_skipped > 0 ? ` (${sev.auto_skipped} auto-skipped — pages NOT indexed)` : '') +
-          ` — run \`gbrain sync --skip-failed\` on the host to acknowledge`;
-    checks.push({ name: 'sync_failures', status: sev.status, message: msg });
+    const { checkSyncFailures } = await import('./checks/sync-failures.ts');
+    const check = await checkSyncFailures(engine, { sourceIds: opts.sourceIds, remote: true });
+    checks.push(check ?? { name: 'sync_failures', status: 'ok', message: 'No unresolved sync failures' });
   } catch {
-    checks.push({ name: 'sync_failures', status: 'ok', message: 'No failures recorded' });
+    checks.push({ name: 'sync_failures', status: 'warn', message: 'Durable sync failure state could not be read; health is unknown.' });
   }
 
   // 4b. Multi-source drift (v0.31.8 — D8 + D14). Same shape as the local
@@ -273,8 +274,11 @@ export async function doctorReportRemote(
   // returned to the thin-client over MCP.
   try {
     const { findMisroutedPages } = await import('../../core/multi-source-drift.ts');
+    // Source isolation: a scoped caller's roster (and the sample slugs the
+    // walk returns) stays inside its grant; unscoped = brain-wide.
     const sources = await engine.executeRaw<{ id: string; local_path: string | null }>(
-      `SELECT id, local_path FROM sources`,
+      `SELECT id, local_path FROM sources ${opts.sourceIds ? 'WHERE id = ANY($1::text[])' : ''}`,
+      opts.sourceIds ? [opts.sourceIds] : undefined,
     );
     const nonDefaultWithPath = sources.filter(s => s.id !== 'default' && s.local_path);
     if (sources.length > 1 && nonDefaultWithPath.length > 0) {
@@ -371,6 +375,8 @@ export async function doctorReportRemote(
 
   // 6. Sync freshness check
   checks.push(await checkSyncFreshness(engine));
+  const contentWrites = await (await import('./checks/canonical-content.ts')).checkCanonicalContentWrites(engine, opts.sourceIds);
+  if (contentWrites) checks.push(contentWrites);
 
   // v0.41.19.0 (Issue 5): sync --all consolidation nudge for multi-source brains.
   checks.push(await checkSyncConsolidation(engine));
@@ -387,8 +393,9 @@ export async function doctorReportRemote(
   // #4576 (related gap): extract_atoms_backlog was absent from the
   // thin-client surface, so an MCP-only caller couldn't see the backlog at
   // all. SQL counts + pack/config reads on the server side — the env that
-  // actually runs (or fails to run) the cycle.
-  checks.push(await computeExtractAtomsBacklogCheck(engine));
+  // actually runs (or fails to run) the cycle. Source-scoped like the
+  // connection count: the roster + per-source backlog stay inside the grant.
+  checks.push(await computeExtractAtomsBacklogCheck(engine, { sourceIds: opts.sourceIds }));
 
   // v0.39 T7 + T9 — schema-pack health checks (3 checks per v0.38 plan):
   //   schema_pack_active        — active pack resolves cleanly
@@ -441,7 +448,11 @@ export async function doctorReportRemote(
   //   - chunker_version drift (pre-v40 pages not yet re-embedded)
   //   - contextual_retrieval_mode IS NULL (mode never evaluated)
   //   - synopsis-failures audit JSONL entries from the last 7 days
-  checks.push(await checkContextualRetrievalCoverage(engine));
+  checks.push(await checkContextualRetrievalCoverage(engine, { sourceIds: opts.sourceIds }));
+  checks.push(await checkProjectionReadiness(engine, {
+    sourceIds: opts.sourceIds,
+    excludePrivate: await resolveExcludePrivatePages(engine, opts.remote),
+  }));
 
   // issue #1777 — hidden_by_search_policy: chunked pages withheld from default
   // search by the hard-exclude prefix policy. Pure SQL COUNT, safe on the

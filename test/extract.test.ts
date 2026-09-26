@@ -88,6 +88,32 @@ describe('extractLinksFromFile', () => {
     expect(companyLinks[0].to_slug).toBe('companies/acme-example');
   });
 
+  it('frontmatter attendees: a stroke-letter name resolves to the unfolded page slug sync mints (#4855)', async () => {
+    // The FS resolver has no fuzzy fallback, so it must try the sync slug
+    // grammar (which keeps đ) as well as the folded basename form.
+    const content = '---\nattendees: [Đức Example]\ntype: meeting\n---\nNotes.';
+    const allSlugs = new Set(['meetings/sync', 'people/đuc-example']);
+    const links = await extractLinksFromFile(content, 'meetings/sync.md', allSlugs, { includeFrontmatter: true });
+    const attended = links.filter(l => l.link_type === 'attended');
+    expect(attended).toHaveLength(1);
+    expect(attended[0].from_slug).toBe('people/đuc-example');
+    expect(attended[0].to_slug).toBe('meetings/sync');
+  });
+
+  it('frontmatter attendees: a stroke-letter name also resolves to the FOLDED ASCII page slug (#4855)', async () => {
+    // The other half of the dual-form lookup: the basename index keys through
+    // normalizeBasename, which folds đ → d, so a people page minted with an
+    // ASCII slug resolves too. Without the fold the key stays `đuc-example`
+    // and the lookup misses in silence.
+    const content = '---\nattendees: [Đức Example]\ntype: meeting\n---\nNotes.';
+    const allSlugs = new Set(['meetings/sync', 'people/duc-example']);
+    const links = await extractLinksFromFile(content, 'meetings/sync.md', allSlugs, { includeFrontmatter: true });
+    const attended = links.filter(l => l.link_type === 'attended');
+    expect(attended).toHaveLength(1);
+    expect(attended[0].from_slug).toBe('people/duc-example');
+    expect(attended[0].to_slug).toBe('meetings/sync');
+  });
+
   it('extracts frontmatter investors array (v0.13: incoming direction)', async () => {
     // v0.13: deal page with investors:[yc, threshold] emits INCOMING edges:
     // companies/yc → deals/seed invested_in and same for threshold.
@@ -374,5 +400,25 @@ describe('extractLinksFromFile — slug normalization (T-OBS-1 regression)', () 
     );
     expect(links.length).toBeGreaterThanOrEqual(1);
     expect(links[0].from_slug).toBe('decisions/0001-living-repo-pattern');
+  });
+});
+
+// #4995: the FS walker's mdPattern required `.md)` to be adjacent, so an
+// anchored link (`[B](b.md#section)`) produced no edge — while its own doc
+// comment promised anchors are stripped.
+describe('#4995 — anchored markdown links on the FS path', () => {
+  it('extractMarkdownLinks strips the #anchor', () => {
+    const links = extractMarkdownLinks('[see](b.md#section) and [D](../registry/tally.md#a b)');
+    expect(links).toHaveLength(2);
+    expect(links[0].relTarget).toBe('b.md');
+    expect(links[1].relTarget).toBe('../registry/tally.md');
+  });
+
+  it('extractLinksFromFile links an anchored sibling', async () => {
+    const allSlugs = new Set(['a', 'b']);
+    const links = await extractLinksFromFile('See [B](b.md#section).', 'a.md', allSlugs);
+    expect(links).toHaveLength(1);
+    expect(links[0].from_slug).toBe('a');
+    expect(links[0].to_slug).toBe('b');
   });
 });

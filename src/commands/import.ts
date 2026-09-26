@@ -1,9 +1,11 @@
-import { readdirSync, lstatSync, existsSync } from 'fs';
+import { hasSourceFilesystemLock, withSourceFilesystemLock, currentSourceFilesystemSignal } from '../core/minions/source-filesystem.ts';
+import { readdirSync, lstatSync, existsSync, mkdirSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { isAbsolute, join, relative, resolve, sep } from 'path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
 import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
+import { currentCompanyBrainSync, getCompanyBrainProfile, importCompanyBrainFile } from '../core/company-brain/profile.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -28,6 +30,9 @@ import {
   resumeFilter,
 } from '../core/import-checkpoint.ts';
 import { realpathOrResolve } from '../core/path-confine.ts';
+import { slog } from '../core/console-prefix.ts';
+import { refreshProjectionStatistics } from '../core/search/projection-statistics.ts';
+import { importManagedFile } from '../core/persistence/import-mutations.ts';
 
 /** Return a refusal when an import target lies outside every admitted root. */
 export function configuredRootImportError(dir: string, configuredRoots: string[]): string | null {
@@ -123,12 +128,15 @@ function defaultWorkers(): number {
  */
 export class ImportAbortError extends Error {
   readonly exitCode: number;
+  /** Present only after an interrupted import has drained and checkpointed. */
+  readonly partialResult?: RunImportResult;
   /** True: the user-facing message was already printed at the throw site. */
   readonly alreadyReported = true;
-  constructor(reason: string, exitCode = 1) {
+  constructor(reason: string, exitCode = 1, partialResult?: RunImportResult) {
     super(`import aborted: ${reason}`);
     this.name = 'ImportAbortError';
     this.exitCode = exitCode;
+    this.partialResult = partialResult;
   }
 }
 
@@ -166,6 +174,7 @@ export async function runImport(
   engine: BrainEngine,
   args: string[],
   opts: {
+    signal?: AbortSignal;
     commit?: string;
     strategy?: SyncStrategy;
     sourceId?: string;
@@ -199,6 +208,9 @@ export async function runImport(
     slugRoot?: string;
   } = {},
 ): Promise<RunImportResult> {
+  const inheritedSignal = currentSourceFilesystemSignal();
+  const signal = opts.signal && inheritedSignal ? AbortSignal.any([opts.signal, inheritedSignal]) : opts.signal ?? inheritedSignal;
+  signal?.throwIfAborted();
   const noEmbed = args.includes('--no-embed');
   const allowNoncanonicalRoot = args.includes('--allow-noncanonical-root');
   const fresh = args.includes('--fresh');
@@ -213,9 +225,13 @@ export async function runImport(
   // always writes to stderr. Stdout stays clean for data output (--json
   // payloads)"). Pre-fix, `import --json` prefixed the payload with
   // "Found N markdown files", so JSON.parse of stdout failed outright.
+  // The human branch goes through slog() so an in-process caller running in
+  // its own --json mode (`sync --json` → performFullSync → runImport, wrapped
+  // in withHumanLogsToStderr) keeps its stdout clean too; outside any wrap
+  // slog IS console.log.
   const info = (msg: string): void => {
     if (jsonOutput) console.error(msg);
-    else console.log(msg);
+    else slog(msg);
   };
 
   // T7 (D9): refuse cleanly when init persisted the deferred-setup sentinel,
@@ -253,37 +269,51 @@ export async function runImport(
       throw e;
     }
   }
-  // v0.39 T1.5: load active pack ONCE at runImport entry; thread to every
-  // per-file importFile call below. Codex perf finding #7 — never per-file.
-  let importActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> } | undefined;
-  try {
-    const { loadActivePack } = await import('../core/schema-pack/load-active.ts');
-    const { loadConfig } = await import('../core/config.ts');
-    const resolved = await loadActivePack({
-      cfg: loadConfig(),
-      remote: false, // CLI import is trusted
-      sourceId: opts.sourceId,
-    });
-    importActivePack = { page_types: resolved.manifest.page_types };
-  } catch {
-    importActivePack = undefined;
-  }
-
   // v0.30.x follow-up to PR #707: programmatic sourceId support so internal
   // callers (performFullSync, future Step 6 paths) can route to a named
   // source.
   //
-  // v0.37.7.0 #1167+#1222: the CLI surface now also accepts a
-  // `--source-id <id>` flag (named to avoid colliding with `--source`
-  // which other commands use for different axes). Pre-fix, users
-  // passing `gbrain import --source dept-x ...` silently fell back to
-  // default because the parser ignored the flag. Now an explicit
-  // `--source-id <id>` opt-in routes the import to that source.
-  // Programmatic callers continue passing `opts.sourceId` directly;
-  // CLI callers' flag wins over opts when both are set.
+  // #1167: the CLI flag shipped as `--source-id <id>`. #4862: `--source <id>`
+  // is an alias — it is what every sibling command and the resolver's own
+  // nudge tell users to pass, import has no competing --source axis, and the
+  // flag registry already accepted it, so pre-alias it was silently IGNORED
+  // (pages landed in default). Both spellings with different values abort.
+  // Programmatic callers continue passing `opts.sourceId` directly; CLI
+  // flags win over opts when both are set. Both the `--source value` and
+  // `--source=value` spellings are accepted (same for --source-id); a missing
+  // value (or a value that is itself a flag) is refused the way sync-delegate
+  // refuses it, never read as "no scope".
   const sourceIdIdx = args.indexOf('--source-id');
-  const flagSourceId = sourceIdIdx !== -1 ? args[sourceIdIdx + 1] : null;
-  let sourceId: string | undefined = flagSourceId ?? opts.sourceId;
+  const sourceIdx = args.indexOf('--source');
+  const readSourceFlag = (flag: string, idx: number): string | null => {
+    const eq = args.find((a) => a.startsWith(`${flag}=`));
+    const v = eq !== undefined ? eq.slice(flag.length + 1) : idx !== -1 ? args[idx + 1] : null;
+    if (v === null) return null;
+    if (v === undefined || v === '' || v.startsWith('--')) {
+      console.error(`${flag} (missing value)`);
+      throw new ImportAbortError(`${flag} (missing value)`);
+    }
+    return v;
+  };
+  const viaSourceId = readSourceFlag('--source-id', sourceIdIdx);
+  const viaSource = readSourceFlag('--source', sourceIdx);
+  if (viaSourceId && viaSource && viaSourceId !== viaSource) {
+    console.error('Pass either --source or --source-id, not both.');
+    throw new ImportAbortError('conflicting source flags');
+  }
+  const flagSourceId = viaSourceId ?? viaSource;
+  let sourceId: string | undefined = opts.sourceId;
+  if (flagSourceId) {
+    // Validate + assert existence through the shared resolver (tier 1), so an
+    // invalid or unregistered id fails once with the same SourceTargetError
+    // sync gives — not once per file on the pages.source_id foreign key.
+    const { resolveSourceWithTier, ALL_SOURCES } = await import('../core/source-resolver.ts');
+    if (flagSourceId === ALL_SOURCES) {
+      console.error(`import writes to one source; \`${ALL_SOURCES}\` is not a write target.`);
+      throw new ImportAbortError('__all__ is not an import target');
+    }
+    sourceId = (await resolveSourceWithTier(engine, flagSourceId)).source_id;
+  }
 
   // v0.41.13 (#1434): when no explicit source / env / opts.sourceId is set,
   // fall through to the resolver so the new sole_non_default tier (5.5) can
@@ -339,6 +369,19 @@ export async function runImport(
       }
     }
   }
+  if (!currentCompanyBrainSync(sourceId) && await getCompanyBrainProfile(engine, sourceId ?? 'default')) {
+    console.error('This source accepts only its approved committed company-brain manifest. Use sources resume or sync; ordinary import cannot write back to this read-only repository.');
+    throw new ImportAbortError('company-brain sources require approved committed ingestion');
+  }
+  let importActivePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> } | undefined;
+  try {
+    const { loadActivePackForEngine } = await import('../core/schema-pack/engine-resolution.ts');
+    const resolved = await loadActivePackForEngine(engine, { remote: false, sourceId });
+    importActivePack = { page_types: resolved.manifest.page_types };
+  } catch {
+    importActivePack = undefined;
+  }
+
   const workersIdx = args.indexOf('--workers');
   const workersArg = workersIdx !== -1 ? args[workersIdx + 1] : null;
   // v0.22.13 (PR #490 Q2): shared parseWorkers helper rejects bad input
@@ -360,10 +403,11 @@ export async function runImport(
   const flagValues = new Set<number>();
   if (workersIdx !== -1) flagValues.add(workersIdx + 1);
   if (sourceIdIdx !== -1) flagValues.add(sourceIdIdx + 1);
+  if (sourceIdx !== -1) flagValues.add(sourceIdx + 1);
   const dirArg = args.find((a, i) => !a.startsWith('--') && !flagValues.has(i));
 
   if (!dirArg) {
-    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source-id <id>] [--include-gitignored] [--allow-noncanonical-root] [--json]');
+    console.error('Usage: gbrain import <dir> [--no-embed] [--workers N] [--fresh] [--source <id> | --source-id <id>] [--include-gitignored] [--allow-noncanonical-root] [--json]');
     throw new ImportAbortError('no import directory given');
   }
   // #1728: capture the import target ONCE as an absolute real path. Every
@@ -378,6 +422,27 @@ export async function runImport(
     const msg = e instanceof Error ? e.message : String(e);
     console.error(`Import target is not readable: ${dirArg} (${msg})`);
     throw new ImportAbortError(`import target not readable: ${dirArg}`);
+  }
+
+  const [persistence] = await engine.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
+  const managedImport = persistence?.enabled === true;
+  if (managedImport && dir !== resolve(dirArg)) throw new ImportAbortError('managed import refuses a symlinked input root');
+  const singleFile = managedImport && lstatSync(dir).isFile();
+  const importRoot = singleFile ? dirname(dir) : dir;
+
+  if (!managedImport && !hasSourceFilesystemLock(dir)) {
+    let entered = false;
+    try {
+      return await withSourceFilesystemLock(engine, dir, () => {
+        entered = true;
+        return runImport(engine, args, opts);
+      }, { signal });
+    } catch (error) {
+      // Root discovery is part of admission. Preserve the CLI/library's typed
+      // preflight error contract without changing errors from an import in flight.
+      if (entered || signal?.aborted) throw error;
+      throw new ImportAbortError('source filesystem lock admission failed');
+    }
   }
 
   if (!allowNoncanonicalRoot) {
@@ -417,7 +482,9 @@ export async function runImport(
   const _walkT0 = Date.now();
   console.error(`[gbrain phase] import.collect_files start dir=${dir} strategy=${strategy}`);
   const malformedExcluded: string[] = [];
-  let allFiles = collectSyncableFiles(dir, {
+  const company = currentCompanyBrainSync(sourceId);
+  let allFiles = company ? company.plan.manifest.filter(entry => entry.disposition === 'included').map(entry => join(dir, entry.path))
+    : singleFile ? [dir] : collectSyncableFiles(dir, {
     strategy, includeGitignored,
     includeHidden: opts.includeHidden,
     onExcluded: (rel) => { malformedExcluded.push(rel); },
@@ -436,7 +503,7 @@ export async function runImport(
   const fileTypeLabel = strategy === 'code' ? 'code'
     : strategy === 'auto' ? 'syncable' : 'markdown';
   // #753/#774: apply --exclude glob patterns (threaded by performFullSync).
-  if (opts.exclude && opts.exclude.length > 0) {
+  if (!company && opts.exclude && opts.exclude.length > 0) {
     const beforeExclude = allFiles.length;
     allFiles = allFiles.filter(abs => !matchesAnyGlob(relative(dir, abs), opts.exclude));
     info(
@@ -463,7 +530,11 @@ export async function runImport(
   // (parallel-import silent-skip and failed-file no-retry).
   const checkpointPath = gbrainPath('import-checkpoint.json');
   const completed = new Set<string>();
-  if (!fresh) {
+  if (company) {
+    await company.protect([{ op: 'company-brain-content', fingerprint: company.receiptId, kind: 'content' }]);
+    const [row] = await engine.executeRaw<{ completed_keys: string[] }>("SELECT completed_keys FROM op_checkpoints WHERE op='company-brain-content' AND fingerprint=$1", [company.receiptId]);
+    for (const path of row?.completed_keys ?? []) completed.add(path);
+  } else if (!fresh && !managedImport) {
     const cp = loadCheckpoint(checkpointPath, dir);
     if (cp) {
       for (const p of cp.completedPaths) completed.add(p);
@@ -549,12 +620,13 @@ export async function runImport(
   }
 
   async function processFile(eng: BrainEngine, filePath: string) {
-    const relativePath = relative(dir, filePath);
+    if (signal?.aborted) return;
+    const relativePath = singleFile ? basename(filePath) : relative(dir, filePath);
     // #753/#774: slug + source_path base. When performFullSync syncs a
     // monorepo subdir, slugRoot is the git root so slugs stay git-root-
     // relative (matching the incremental path's git-diff paths). The
     // checkpoint (`completed`) stays dir-relative — resumeFilter's contract.
-    const importRelPath = opts.slugRoot ? relative(opts.slugRoot, filePath) : relativePath;
+    const importRelPath = opts.slugRoot ? relative(opts.slugRoot, filePath) : relative(importRoot, filePath);
     // v0.31.2 (D5): per-file slow-path log. Fires only when a single
     // file takes >5s. The user's hang surfaces as one file taking
     // forever — without this, the agent can't see which file.
@@ -564,9 +636,13 @@ export async function runImport(
       // multimodal is enabled. The walker (collectMarkdownFiles) only picks
       // up images when GBRAIN_EMBEDDING_MULTIMODAL=true so this branch is
       // unreachable when the gate is off; defense-in-depth check anyway.
-      const result = isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
+      const result = company ? await importCompanyBrainFile(eng, filePath, sourceId!) : managedImport
+        ? await importManagedFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack, signal, slugRoot: opts.slugRoot })
+        : isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
         ? await importImageFile(eng, filePath, importRelPath, { noEmbed, sourceId })
         : await importFile(eng, filePath, importRelPath, { noEmbed, sourceId, activePack: importActivePack });
+      // An import that landed while cancellation arrived is still complete.
+      // Account for it before stopping, so resume never loses a successful path.
       noteTypeWarning((result as { type_warning?: Parameters<typeof noteTypeWarning>[0] }).type_warning);
       const _fileMs = Date.now() - _fileT0;
       if (_fileMs > 5000) {
@@ -588,6 +664,7 @@ export async function runImport(
           malformedFileSkips++;
           completed.add(relativePath);
         } else if (result.error && result.error !== 'unchanged') {
+          errors++;
           console.error(`  Skipped ${relativePath}: ${result.error}`);
           // Bug 9 — non-"unchanged" skips carry a real error reason.
           // #774: ledger paths use the slug base so an incremental sync's
@@ -601,6 +678,11 @@ export async function runImport(
         }
       }
     } catch (e: unknown) {
+      if (signal?.aborted) {
+        // Do not turn an unrelated infrastructure failure into a timeout.
+        if (e !== signal.reason && !(e instanceof Error && e.name === 'AbortError')) throw e;
+        return;
+      }
       const msg = e instanceof Error ? e.message : String(e);
       const { count, sample } = recordImportFailure(errorCounts, errorSamples, msg);
       if (count <= 5) {
@@ -614,6 +696,11 @@ export async function runImport(
     }
     processed++;
     tickProgress();
+    if (company) {
+      await engine.executeRaw("INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES('company-brain-content',$1,$2::text::jsonb) ON CONFLICT(op,fingerprint) DO UPDATE SET completed_keys=EXCLUDED.completed_keys,updated_at=now()",
+        [company.receiptId, JSON.stringify([...completed])]);
+      return;
+    }
     // Save checkpoint every 100 SUCCESSFUL adds (not every 100 processed).
     // Failed files never enter `completed`, so a flaky file can't push the
     // checkpoint past it — the next run will retry it.
@@ -644,67 +731,87 @@ export async function runImport(
     }
   }
 
-  if (actualWorkers > 1) {
-    // v0.22.13 (PR #490 A1 + Q3): use engine.kind discriminator (not config.engine
-    // string sniff) and fall back to serial when database_url is unset. Both
-    // checks belt-and-suspenders so we never crash on a null assertion.
-    const config = loadConfig();
-    if (engine.kind === 'pglite' || !config?.database_url) {
-      for (const file of files) {
-        await processFile(engine, file);
-      }
-    } else {
-      const { PostgresEngine } = await import('../core/postgres-engine.ts');
-      const { resolvePoolSize } = await import('../core/db.ts');
-      // Each child keeps the established two-connection pool. GBRAIN_POOL_SIZE
-      // controls the parent pool; GBRAIN_MAX_CONNECTIONS clamps the child
-      // count above so the combined footprint stays within the operator's cap.
-      const workerPoolSize = Math.min(2, resolvePoolSize(2));
-      const databaseUrl = config.database_url;
-
-      // v0.22.13 (PR #490 A2): connect workers serially so a partial failure
-      // leaves us with the connected ones already pushed onto workerEngines
-      // for the finally-block cleanup. The prior Promise.all could leak any
-      // engine that connected before another's connect() rejected.
-      const workerEngines: InstanceType<typeof PostgresEngine>[] = [];
-      try {
-        for (let i = 0; i < actualWorkers; i++) {
-          const eng = new PostgresEngine();
-          await eng.connect({ database_url: databaseUrl, poolSize: workerPoolSize });
-          workerEngines.push(eng);
+  let workerError: unknown;
+  let workerFailed = false;
+  try {
+    if (actualWorkers > 1) {
+      // v0.22.13 (PR #490 A1 + Q3): use engine.kind discriminator (not config.engine
+      // string sniff) and fall back to serial when database_url is unset. Both
+      // checks belt-and-suspenders so we never crash on a null assertion.
+      const config = loadConfig();
+      if (engine.kind === 'pglite' || !config?.database_url) {
+        for (const file of files) {
+          if (signal?.aborted) break;
+          await processFile(engine, file);
         }
+      } else {
+        const { PostgresEngine } = await import('../core/postgres-engine.ts');
+        const { resolvePoolSize } = await import('../core/db.ts');
+        // Each child keeps the established two-connection pool. GBRAIN_POOL_SIZE
+        // controls the parent pool; GBRAIN_MAX_CONNECTIONS clamps the child
+        // count above so the combined footprint stays within the operator's cap.
+        const workerPoolSize = Math.min(2, resolvePoolSize(2));
+        const databaseUrl = config.database_url;
 
-        // Thread-safe queue: atomic index counter (JS is single-threaded; the
-        // read-then-increment happens between awaits so no lock is needed).
-        let queueIndex = 0;
-        await Promise.all(workerEngines.map(async (eng) => {
-          while (true) {
-            const idx = queueIndex++;
-            if (idx >= files.length) break;
-            await processFile(eng, files[idx]);
+        // v0.22.13 (PR #490 A2): connect workers serially so a partial failure
+        // leaves us with the connected ones already pushed onto workerEngines
+        // for the finally-block cleanup. The prior Promise.all could leak any
+        // engine that connected before another's connect() rejected.
+        const workerEngines: InstanceType<typeof PostgresEngine>[] = [];
+        try {
+          for (let i = 0; i < actualWorkers; i++) {
+            if (signal?.aborted) break;
+            const eng = new PostgresEngine();
+            await eng.connect({ database_url: databaseUrl, poolSize: workerPoolSize });
+            workerEngines.push(eng);
           }
-        }));
-      } finally {
-        // v0.22.13 (PR #490 A2): try/finally guarantees cleanup even when the
-        // worker loop throws. Each disconnect is best-effort — one failing
-        // disconnect must not strand the others.
-        await Promise.all(
-          workerEngines.map(e =>
-            e.disconnect().catch((err: unknown) =>
-              console.error(`  worker disconnect failed: ${err instanceof Error ? err.message : String(err)}`),
-            ),
-          ),
-        );
-      }
-    } // end else (postgres parallel)
-  } else {
-    // Sequential: use the provided engine
-    for (const filePath of files) {
-      await processFile(engine, filePath);
-    }
-  }
 
-  progress.finish();
+          // Thread-safe queue: atomic index counter (JS is single-threaded; the
+          // read-then-increment happens between awaits so no lock is needed).
+          let queueIndex = 0;
+          let stopWorkers = false;
+          const outcomes = await Promise.allSettled(workerEngines.map(async (eng) => {
+            try {
+              while (!stopWorkers && !signal?.aborted) {
+                const idx = queueIndex++;
+                if (idx >= files.length) break;
+                await processFile(eng, files[idx]);
+              }
+            } catch (error) {
+              stopWorkers = true;
+              throw error;
+            }
+          }));
+          // Drain every in-flight file before disconnecting pools or releasing
+          // the source lock, even when one worker fails or cancellation arrives.
+          const failed = outcomes.find(outcome => outcome.status === 'rejected');
+          if (failed?.status === 'rejected') throw failed.reason;
+        } finally {
+          // v0.22.13 (PR #490 A2): try/finally guarantees cleanup even when the
+          // worker loop throws. Each disconnect is best-effort — one failing
+          // disconnect must not strand the others.
+          await Promise.all(
+            workerEngines.map(e =>
+              e.disconnect().catch((err: unknown) =>
+                console.error(`  worker disconnect failed: ${err instanceof Error ? err.message : String(err)}`),
+              ),
+            ),
+          );
+        }
+      } // end else (postgres parallel)
+    } else {
+      // Sequential: use the provided engine
+      for (const filePath of files) {
+        if (signal?.aborted) break;
+        await processFile(engine, filePath);
+      }
+    }
+  } catch (error) {
+    workerFailed = true;
+    workerError = error;
+  } finally {
+    progress.finish();
+  }
 
   // Error summary
   for (const [key, count] of Object.entries(errorCounts)) {
@@ -713,52 +820,29 @@ export async function runImport(
     }
   }
 
-  // Final checkpoint save BEFORE the clear/preserve decision below. The
-  // periodic triggers above are gated on a 100-file boundary or an interval,
-  // so a run that ends between them would otherwise leave its tail unsaved.
-  // This must run before clearCheckpoint() so a clean run still ends with no
-  // checkpoint file — it only makes the ERROR path's preserved checkpoint
-  // complete.
-  if (errors > 0 && completed.size > lastCheckpointSize) {
+  // Save the successful tail on interruption/failure. Keep this synchronous:
+  // checkpoint and cancellation decisions must not race another worker.
+  function preserveCompletedPaths(): void {
+    if (company) return;
+    if (completed.size <= lastCheckpointSize) return;
     try {
-      const cpDir = gbrainPath();
-      if (!existsSync(cpDir)) {
-        const { mkdirSync } = await import('fs');
-        mkdirSync(cpDir, { recursive: true });
-      }
+      mkdirSync(gbrainPath(), { recursive: true });
       saveCheckpoint(checkpointPath, {
-        schema_version: 1,
-        owner: 'gbrain',
-        kind: 'import',
-        dir,
-        completedPaths: Array.from(completed),
-        timestamp: new Date().toISOString(),
+        schema_version: 1, owner: 'gbrain', kind: 'import', dir,
+        completedPaths: Array.from(completed), timestamp: new Date().toISOString(),
       });
-    } catch { /* non-fatal: the next run simply redoes the tail */ }
+      lastCheckpointSize = completed.size;
+    } catch { /* non-fatal: resume can safely recheck content hashes */ }
   }
-
-  // Clear checkpoint on clean completion. On error, the path-based checkpoint
-  // preserves only the successfully-completed paths, so the next run retries
-  // failed files automatically (they never entered `completed`).
-  if (errors === 0) {
-    clearCheckpoint(checkpointPath);
-  } else if (existsSync(checkpointPath)) {
-    info(`  Checkpoint preserved (${errors} errors). Run again to retry failed files.`);
+  function throwIfInterrupted(): void {
+    if (!signal?.aborted) return;
+    preserveCompletedPaths();
+    console.error(`Import interrupted: ${imported} pages imported; completed paths preserved for resume.`);
+    throw new ImportAbortError('interrupted', 1, { imported, skipped, errors, chunksCreated, failures });
   }
-
-  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-  if (jsonOutput) {
-    console.log(JSON.stringify({
-      status: 'success', duration_s: parseFloat(totalTime),
-      imported, skipped, errors, chunks: chunksCreated,
-      total_files: allFiles.length,
-    }));
-  } else {
-    console.log(`\nImport complete (${totalTime}s):`);
-    console.log(`  ${imported} pages imported`);
-    console.log(`  ${skipped} pages skipped (${skipped - errors} unchanged, ${errors} errors)`);
-    console.log(`  ${chunksCreated} chunks created`);
-  }
+  if (errors > 0 || workerFailed) preserveCompletedPaths();
+  if (workerFailed) throw workerError;
+  throwIfInterrupted();
 
   // v0.39 T7 — end-of-run schema mismatch warn. Fires ONCE per import,
   // not per page. Counts untyped pages in the affected source AND
@@ -825,6 +909,8 @@ export async function runImport(
     });
   }
 
+  throwIfInterrupted();
+
   // Import → sync continuity: write sync checkpoint if this is a git repo.
   // Bug 9 — gate last_commit on "no failures" so import doesn't silently
   // stomp on the sync bookmark when parsing broke. last_run + repo_path are
@@ -843,7 +929,7 @@ export async function runImport(
   // ledger + bookmark via the shared gate (applySyncFailureGate). Skipping the
   // internal handling here prevents double-recording (which would double-count
   // the auto-skip `attempts` streak) and a competing bookmark write.
-  if (gitHead && !opts.managedBookmark) {
+  if (gitHead && !opts.managedBookmark && !managedImport) {
     // Record failures into the central JSONL so doctor can surface them.
     // Use gitHead as the commit so a later sync can tell "same broken
     // state as last time" from "new broken state." Source-scoped (#1939 #2).
@@ -880,6 +966,7 @@ export async function runImport(
     // legacy branch in sync.ts, so the two layers cannot drift).
     const { ownsGlobalSyncAnchor } = await import('../core/sync.ts');
     const { owns, configured } = await ownsGlobalSyncAnchor(engine, sourceId, dir);
+    throwIfInterrupted();
 
     if (owns) {
       if (failures.length === 0) {
@@ -929,7 +1016,7 @@ export async function runImport(
   // that silently dropped files isn't "clean" for freshness purposes even
   // with zero recorded failures.
   const totalMalformed = malformedExcluded.length + malformedFileSkips;
-  if (sourceId && failures.length === 0 && totalMalformed === 0 && !opts.managedBookmark) {
+  if (sourceId && failures.length === 0 && totalMalformed === 0 && !opts.managedBookmark && !managedImport) {
     try {
       const [row] = await engine.executeRaw<{ local_path: string | null; config: unknown }>(
         `SELECT local_path, config FROM sources WHERE id = $1`,
@@ -971,13 +1058,47 @@ export async function runImport(
         }
       }
       if (row?.local_path && coversRegisteredRoot && !sourceConfigHasRemoteUrl(row.config) && !isGitTracked && !isConnectorManaged) {
+        throwIfInterrupted();
         await engine.executeRaw(`UPDATE sources SET last_sync_at = now() WHERE id = $1`, [sourceId]);
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof ImportAbortError) throw error;
       // best-effort — a freshness nicety never fails the import (see above).
     }
   }
 
+  throwIfInterrupted();
+  // Only a fully completed run removes resume state, including async metadata.
+  if (errors === 0 && !company) clearCheckpoint(checkpointPath);
+  else if (existsSync(checkpointPath)) info(`  Checkpoint preserved (${errors} errors). Run again to retry failed files.`);
+
+  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+  if (jsonOutput) {
+    // `skipped` includes every per-file failure importFile RETURNS (invalid
+    // frontmatter, oversize, symlink, slug mismatch) as well as content-hash
+    // no-ops. `errors` counts both returned failures and thrown failures.
+    // The failure ledger is
+    // written only for git-repo dirs (see the gitHead gate below), so a caller
+    // importing a scratch directory has no other channel. Emit the per-file
+    // list so state can be gated per file.
+    console.log(JSON.stringify({
+      status: errors > 0 ? 'partial' : 'success', duration_s: parseFloat(totalTime),
+      imported, skipped, errors, chunks: chunksCreated,
+      total_files: allFiles.length,
+      unchanged: skipped - failures.length - malformedFileSkips,
+      malformed_skipped: malformedFileSkips,
+      failures,
+      // Effective destination — same expression as the import-file write (import-file.ts) and the ingest_log row below.
+      source_id: sourceId ?? 'default',
+    }));
+  } else {
+    slog(`\nImport complete (${totalTime}s):`);
+    slog(`  ${imported} pages imported`);
+    slog(`  ${skipped} pages skipped (${skipped - failures.length - malformedFileSkips} unchanged, ${errors} errors, ${malformedFileSkips} malformed filenames)`);
+    slog(`  ${chunksCreated} chunks created`);
+  }
+
+  if (imported > 0 && !opts.managedBookmark) await refreshProjectionStatistics(engine);
   return {
     imported, skipped, errors, chunksCreated, failures,
     ...(totalMalformed > 0 ? { malformedSkipped: totalMalformed } : {}),

@@ -42,7 +42,12 @@
     {
       "name": "setup",
       "path": "setup/SKILL.md",
-      "description": "Set up GBrain: auto-provision Supabase or PGLite, AGENTS.md injection, first import"
+      "description": "Add keyless GBrain memory to an existing agent, or connect a hosted brain while preserving identity and configuration"
+    },
+    {
+      "name": "mcp-access",
+      "path": "mcp-access/SKILL.md",
+      "description": "Open the owner dashboard, manage MCP clients and access, and connect native OAuth harnesses with the correct authority"
     },
     {
       "name": "publish",
@@ -57,7 +62,7 @@
     {
       "name": "signal-detector",
       "path": "signal-detector/SKILL.md",
-      "description": "Always-on ambient signal capture. Fires on every message to detect original thinking and entity mentions."
+      "description": "Opt-in ambient signal capture. After explicit enablement, detects original thinking and entity mentions in substantive messages."
     },
     {
       "name": "google-loops",
@@ -368,6 +373,11 @@
       "name": "postgres-adopt",
       "path": "postgres-adopt/SKILL.md",
       "description": "Detect the active engine (PGLite vs Postgres), prefer/install Postgres for harness installs, wrap the guarded engine migration"
+    },
+    {
+      "name": "remote-mcp",
+      "path": "remote-mcp/SKILL.md",
+      "description": "Publish the user's own gbrain over MCP with `gbrain mcp expose` (Tailscale by default, Funnel only for cloud agents), keep the server alive as a user service, then grant, install and verify one least-privilege client per consumer."
     }
   ],
   "dependencies": {

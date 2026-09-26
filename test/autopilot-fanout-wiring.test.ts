@@ -79,13 +79,30 @@ describe('autopilot.ts ↔ dispatchPerSource wiring', () => {
     // all-coalesced tick (maxPending single-flight suppression) retakes the
     // full-cycle branch every tick and starves the targeted-plan path for the
     // whole in-flight window.
-    expect(AUTOPILOT_SRC).toMatch(
-      /result\.dispatched\.length > 0 \|\| result\.coalesced\.length > 0 \|\| result\.legacy_fallback \|\| result\.all_sources_fresh/,
-    );
+    const updateIdx = AUTOPILOT_SRC.indexOf('lastFullCycleAt = Date.now()');
+    expect(updateIdx).toBeGreaterThan(-1);
+    const advanceGate = AUTOPILOT_SRC.slice(Math.max(0, updateIdx - 400), updateIdx + 80);
+    expect(advanceGate).toContain('result.coalesced.length > 0');
+    // all_sources_handled subsumes all_sources_fresh (fresh + locally skipped
+    // === every source); the redundant arm is gone (wave review).
+    expect(advanceGate).not.toContain('result.all_sources_fresh');
+    expect(advanceGate).toContain('result.all_sources_handled');
+  });
+
+  test('unavailable-path skips in the daemon loops are NDJSON events under --json, and sources-load is a static import (wave review)', () => {
+    // Bare prose on stderr breaks the --json NDJSON stream every other daemon
+    // line keeps; the two skip sites now emit an event in jsonMode.
+    expect(AUTOPILOT_SRC.match(/event: 'freshness_source_path_skipped'/g)?.length).toBe(2);
+    expect(AUTOPILOT_SRC).not.toContain("await import('../core/sources-load.ts')");
+    // The stale "#3696 RELATIVE path" narration is gone: the skip covers any
+    // unavailable path (relative OR missing on this machine).
+    expect(AUTOPILOT_SRC).not.toContain('a RELATIVE local_path is meaningless');
+    expect(AUTOPILOT_SRC).not.toContain('same relative-path skip as the freshness loop');
   });
 
   test('fanout_summary reports coalesced separately from dispatched (honest surfaces)', () => {
     expect(AUTOPILOT_SRC).toMatch(/event: 'fanout_summary',[\s\S]{0,200}coalesced: result\.coalesced/);
+    expect(AUTOPILOT_SRC).toMatch(/event: 'fanout_summary',[\s\S]{0,400}skipped_unavailable_path: result\.skipped_unavailable_path/);
   });
 
   test('targeted-plan dispatch honors the honest-dispatch contract (red-team finding)', () => {
@@ -100,6 +117,45 @@ describe('autopilot.ts ↔ dispatchPerSource wiring', () => {
     expect(freshnessIdx).toBeGreaterThan(-1);
     const freshnessBlock = AUTOPILOT_SRC.slice(Math.max(0, freshnessIdx - 700), freshnessIdx + 200);
     expect(freshnessBlock).toContain('pull: sourceConfigHasRemoteUrl(src.config)');
+  });
+
+  test('freshness sync dispatch skips unavailable source paths before enqueueing', () => {
+    const freshnessIdx = AUTOPILOT_SRC.indexOf('idempotency_key: `autopilot-sync:');
+    expect(freshnessIdx).toBeGreaterThan(-1);
+    const freshnessBlock = AUTOPILOT_SRC.slice(Math.max(0, freshnessIdx - 1400), freshnessIdx + 100);
+    expect(freshnessBlock).toContain('sourceLocalPathSkipWarning(src.id, src.local_path, undefined, src.config)');
+  });
+
+  test('#4399: freshness sync dispatch skips a syncEnabled:false source BEFORE queuing a job', () => {
+    // Real execution of this loop needs the full runAutopilot() daemon (per
+    // this file's own header comment), so this pins the static shape:
+    // the isSyncDisabledConfig skip must sit between the loop's local_path
+    // guard and the queue.add call this file already pins above, so it can
+    // never fire too late to prevent the enqueue. isSyncDisabledConfig
+    // itself has direct unit coverage in test/sync-policy.test.ts.
+    const loopIdx = AUTOPILOT_SRC.indexOf('for (const src of sources) {');
+    expect(loopIdx).toBeGreaterThan(-1);
+    const queueAddIdx = AUTOPILOT_SRC.indexOf('idempotency_key: `autopilot-sync:');
+    expect(queueAddIdx).toBeGreaterThan(loopIdx);
+    const loopBody = AUTOPILOT_SRC.slice(loopIdx, queueAddIdx);
+    // Exact-literal match on the FULL guard clause (condition + continue),
+    // not just the function-call substring — a mutation that keeps calling
+    // isSyncDisabledConfig() but drops the `if (...) continue` (e.g.
+    // `isSyncDisabledConfig(src.config);` as a no-op statement) restores the
+    // #4399 bug while still containing the bare substring, so a loose
+    // `.toContain('isSyncDisabledConfig')` check alone would not catch it.
+    expect(loopBody).toContain('if (isSyncDisabledConfig(src.config)) continue;');
+    // The predicate comes from the sync-policy module via a STATIC import
+    // (the wave review made sources-load static for the same loop; a dynamic
+    // import here would re-introduce what that review removed), not from
+    // performSync's own enforcement — this dispatcher is meant to stand on
+    // its own regardless of what performSync does internally.
+    expect(AUTOPILOT_SRC).toContain("import { isSyncDisabledConfig } from '../core/sync-policy.ts';");
+    expect(AUTOPILOT_SRC).not.toContain("await import('../core/sync-policy.ts')");
+    const skipIdx = loopBody.indexOf('if (isSyncDisabledConfig(src.config)) continue;');
+    const localPathGuardIdx = loopBody.indexOf("if (!src.local_path) continue;");
+    expect(localPathGuardIdx).toBeGreaterThan(-1);
+    expect(skipIdx).toBeGreaterThan(localPathGuardIdx);
   });
 
   test('#4046: targeted dispatch scopes stable recommendation keys to the interval', () => {
@@ -135,9 +191,7 @@ describe('autopilot.ts ↔ dispatchPerSource wiring', () => {
     // must update so the next tick doesn't immediately re-fan-out.
     // Coalesced counts as work-in-flight (see the dedicated advance-gate
     // test below for the full condition).
-    expect(AUTOPILOT_SRC).toMatch(
-      /result\.dispatched\.length > 0 \|\| result\.coalesced\.length > 0 \|\| result\.legacy_fallback \|\| result\.all_sources_fresh/,
-    );
+    expect(AUTOPILOT_SRC).toContain('result.all_sources_handled');
     expect(AUTOPILOT_SRC).toMatch(/lastFullCycleAt\s*=\s*Date\.now\(\)/);
   });
 

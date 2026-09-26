@@ -42,7 +42,7 @@ import {
   type HarnessDeps,
   type HarnessFlags,
 } from '../src/core/bootstrap/harness.ts';
-import { readHarnessReceiptState, harnessReceiptPath, type HarnessTarget } from '../src/core/bootstrap/format.ts';
+import { readHarnessReceiptState, harnessReceiptPath, type HarnessTarget, type HarnessReceipt } from '../src/core/bootstrap/format.ts';
 import {
   CLAUDE_HOOK_EVENTS,
   CODEX_TOML_BLOCK_BEGIN,
@@ -55,18 +55,25 @@ import type { ConnectProbeResult } from '../src/core/connect-probe.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 import { VERSION } from '../src/version.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { SourceTargetError } from '../src/core/source-resolver.ts';
 
 const TOKEN_A = `gbrain_${'a'.repeat(64)}`;
 const TOKEN_B = `gbrain_${'b'.repeat(64)}`;
 const ID_A = '11111111-1111-1111-1111-111111111111';
 const ID_B = '22222222-2222-2222-2222-222222222222';
 const URL = 'http://127.0.0.1:3131/mcp';
+const DEFAULT_MINT_QUEUE = [...'abcdef012345'].map((character, index) => {
+  const digit = (index + 1).toString(16);
+  return { token: `gbrain_${character.repeat(64)}`, id: [8, 4, 4, 4, 12].map(length => digit.repeat(length)).join('-') };
+});
 
 interface Fake {
   deps: HarnessDeps;
   calls: string[][];
   revoked: string[];
   mintCalls: Array<{ name: string; scopes: string[]; sourceGrant?: string[] }>;
+  minted: Array<{ token: string; id: string }>;
+  events: string[];
   out: string[];
   err: string[];
   home: string;
@@ -82,6 +89,12 @@ function makeFake(opts: {
   probeOk?: boolean;
   mintQueue?: Array<{ token: string; id: string }>;
   pgliteLive?: boolean;
+  /** What the brain's ambient resolution (no --source) lands on (absent = the seeded default). */
+  implicitSource?: string;
+  /** The federated read set the ambient resolution carries (default: [implicitSource]). */
+  implicitGrant?: string[];
+  /** Make the hook-source lookup throw (a typo'd --source, or an unopenable engine). */
+  hookSourceError?: Error;
 } = {}): Fake {
   const dir = mkdtempSync(join(tmpdir(), 'gb-harness-'));
   const home = join(dir, '.gbrain');
@@ -94,18 +107,32 @@ function makeFake(opts: {
   const mintCalls: Array<{ name: string; scopes: string[]; sourceGrant?: string[] }> = [];
   const out: string[] = [];
   const err: string[] = [];
-  const mintQueue = opts.mintQueue ?? [{ token: TOKEN_A, id: ID_A }, { token: TOKEN_B, id: ID_B }];
+  const mintQueue = opts.mintQueue ?? DEFAULT_MINT_QUEUE;
+  const minted: Array<{ token: string; id: string }> = [];
+  const events: string[] = [];
   let mintIdx = 0;
   const health = opts.health ?? { ok: true, version: VERSION, engine: 'postgres' };
+  const registrations = new Map<string, { url: string; token: string }>();
 
   const runner: ExecRunner = async (argv: string[]) => {
     calls.push(argv);
     if (argv[0] === 'claude' && argv[2] === 'get') {
-      return opts.mcpGet ? opts.mcpGet(argv[3]) : { code: 1, stdout: '', stderr: 'No MCP server found' };
+      if (opts.mcpGet) return opts.mcpGet(argv[3]);
+      const current = registrations.get(argv[3]);
+      return current
+        ? { code: 0, stdout: `Scope: User\nType: http\nURL: ${current.url}\nHeaders:\n  Authorization: Bearer ${current.token}`, stderr: '' }
+        : { code: 1, stdout: '', stderr: 'No MCP server found' };
     }
     if (argv[0] === 'claude' && argv[2] === 'add') {
+      if (!opts.mcpAddCode) {
+        const url = argv.find(value => /^https?:\/\//.test(value));
+        const header = argv.find(value => value.startsWith('Authorization: Bearer '));
+        if (!url || !header) throw new Error('fixture received an incomplete Claude MCP registration');
+        registrations.set(argv[3], { url, token: header.slice('Authorization: Bearer '.length) });
+      }
       return { code: opts.mcpAddCode ?? 0, stdout: '', stderr: opts.mcpAddCode ? 'add failed' : '' };
     }
+    if (argv[0] === 'claude' && argv[2] === 'remove') registrations.delete(argv[3]);
     return { code: 0, stdout: '', stderr: '' };
   };
 
@@ -125,6 +152,8 @@ function makeFake(opts: {
       // must fail with reason 'auth' or every apply trips the impostor guard.
       const known = new Set([TOKEN_A, TOKEN_B, ...mintQueue.map((m) => m.token)]);
       if (!known.has(probeToken)) return { ok: false, reason: 'auth', message: 'HTTP 401' };
+      const issued = minted.find(m => m.token === probeToken);
+      if (issued) events.push(`probe:${issued.id}`);
       return (opts.probeOk ?? true)
         ? { ok: true, identity: 'brain "test" (source default)' }
         : { ok: false, reason: 'auth', message: 'HTTP 401' };
@@ -134,14 +163,25 @@ function makeFake(opts: {
     opencodeConfig,
     mint: async (o) => {
       mintCalls.push(o as { name: string; scopes: string[]; sourceGrant?: string[] });
-      const m = mintQueue[Math.min(mintIdx++, mintQueue.length - 1)];
-      return { token: m.token, id: m.id, name: 'bootstrap-harness', scopes: ['read', 'write'] };
+      const m = mintQueue[mintIdx++];
+      if (!m) throw new Error('fixture mint queue exhausted; supply another independent token');
+      minted.push(m);
+      events.push(`mint:${m.id}`);
+      return { token: m.token, id: m.id, name: o.name, scopes: [...o.scopes] };
     },
     revokeById: async (id: string) => {
       revoked.push(id);
+      events.push(`revoke:${id}`);
       return true;
     },
+    installSharedSkills: async () => ({ status: 'pending', reason: 'shared_skills_unsupported' }),
     pgliteLiveServe: () => opts.pgliteLive ?? false,
+    resolveHookSource: async (explicit) => {
+      if (opts.hookSourceError) throw opts.hookSourceError;
+      if (explicit) return { source_id: explicit, grant: [explicit] };
+      const id = opts.implicitSource ?? 'default';
+      return { source_id: id, grant: opts.implicitGrant ?? [id] };
+    },
     detectClaude: () => true,
     detectCodex: () => true,
     detectOpencode: () => true,
@@ -149,7 +189,7 @@ function makeFake(opts: {
     log: (l) => out.push(l),
     logError: (l) => err.push(l),
   };
-  return { deps, calls, revoked, mintCalls, out, err, home, userSettings, codexConfig, opencodeConfig };
+  return { deps, calls, revoked, mintCalls, minted, events, out, err, home, userSettings, codexConfig, opencodeConfig };
 }
 
 function flags(extra: string[] = []): HarnessFlags {
@@ -172,6 +212,10 @@ describe('parseHarnessArgs', () => {
     expect(parseHarnessArgs(['--harness', 'cursor']).error).toMatch(/unknown --harness/);
     expect(parseHarnessArgs(['--port', 'nope']).error).toMatch(/invalid --port/);
     expect(parseHarnessArgs(['--name', 'My Server']).error).toMatch(/invalid --name/);
+    // --source was the one flag that skipped validation (wave review).
+    expect(parseHarnessArgs(['--source', 'Not Valid']).error).toMatch(/invalid --source/);
+    expect(parseHarnessArgs(['--source', '__all__']).error).toMatch(/invalid --source/);
+    expect(parseHarnessArgs(['--source', 'wiki']).source).toBe('wiki');
   });
   test('--project is repeatable and resolved', () => {
     const f = parseHarnessArgs(['--project', '/a', '--project', '/b']);
@@ -231,7 +275,12 @@ describe('full apply', () => {
     expect(toml).toContain(CODEX_TOML_BLOCK_BEGIN);
     // #4574: http_headers inline-table credential — never inline bearer_token
     // (codex-cli >=0.149 rejects it at config load, bricking every session).
-    expect(toml).toContain(`http_headers = { Authorization = "Bearer ${TOKEN_A}" }`);
+    expect(toml).toContain(`http_headers = { Authorization = "Bearer ${TOKEN_B}" }`);
+    expect(toml).not.toContain(TOKEN_A);
+    expect((readJson(f.opencodeConfig).mcp as Record<string, { headers: { Authorization: string } }>).gbrain.headers.Authorization)
+      .toBe(`Bearer ${f.minted[2].token}`);
+    expect(new Set(f.minted.map(m => m.id)).size).toBe(3);
+    expect(new Set(f.minted.map(m => m.token)).size).toBe(3);
     expect(toml).not.toContain('bearer_token');
     // Harness-lane codex hooks: hooks.json written beside the TARGET's
     // config.toml (never the ambient global), trust entry in the same toml.
@@ -251,9 +300,14 @@ describe('full apply', () => {
 
     const state = readHarnessReceiptState(f.home);
     expect(state.state).toBe('ok');
-    const receipt = (state as { receipt: { targets: Array<{ state: string }>; token: { id?: string } } }).receipt;
+    const receipt = (state as { receipt: HarnessReceipt }).receipt;
     expect(receipt.targets.every((t) => t.state === 'confirmed')).toBe(true);
     expect(receipt.token.id).toBe(ID_A);
+    expect(receipt.harness_tokens).toEqual({
+      'claude-code': { id: ID_A, minted: true, name: 'bootstrap-harness-claude-code' },
+      codex: { id: ID_B, minted: true, name: 'bootstrap-harness-codex' },
+      opencode: { id: f.minted[2].id, minted: true, name: 'bootstrap-harness-opencode' },
+    });
     // first run: nothing to rotate
     expect(f.revoked).toEqual([]);
   });
@@ -269,32 +323,45 @@ describe('full apply', () => {
   test('re-run rotates mint-first [C7]: one entry per event, previous token revoked by id AFTER confirm', async () => {
     const f = makeFake();
     expect(await applyHarness(flags(), f.deps)).toBe(0);
+    const priorIds = f.minted.map(m => m.id);
     // second run: existing registration points at OUR url → remove+re-add
     const f2deps: HarnessDeps = {
       ...f.deps,
-      runner: async (argv: string[]) => {
-        f.calls.push(argv);
-        if (argv[0] === 'claude' && argv[2] === 'get') {
-          return { code: 0, stdout: `Scope: User\nType: http\nURL: ${URL}\nHeaders:\n  Authorization: Bearer ${TOKEN_A}`, stderr: '' };
-        }
-        return { code: 0, stdout: '', stderr: '' };
+      revokeById: async id => {
+        const current = readHarnessReceiptState(f.home);
+        expect(current.state).toBe('ok');
+        if (current.state !== 'ok') throw new Error('expected current write-ahead receipt');
+        expect(current.receipt.targets.every(target => target.state === 'confirmed')).toBe(true);
+        for (const replacement of f.minted.slice(3)) expect(f.events).toContain(`probe:${replacement.id}`);
+        return f.deps.revokeById!(id);
       },
     };
     expect(await applyHarness(flags(), f2deps)).toBe(0);
-    expect(f.revoked).toEqual([ID_A]); // previous id, only after full confirm
+    expect(f.revoked).toEqual(priorIds);
+    expect(new Set(f.minted.map(m => m.id)).size).toBe(6);
+    expect(new Set(f.minted.map(m => m.token)).size).toBe(6);
+    expect(f.calls.some(argv => argv[0] === 'claude' && argv[2] === 'remove')).toBe(true);
+    for (const replacement of f.minted.slice(3)) {
+      expect(f.events.indexOf(`mint:${replacement.id}`)).toBeLessThan(f.events.indexOf(`revoke:${priorIds[0]}`));
+      expect(f.events.indexOf(`probe:${replacement.id}`)).toBeLessThan(f.events.indexOf(`revoke:${priorIds[0]}`));
+      expect(f.revoked).not.toContain(replacement.id);
+    }
     const settings = readJson(f.userSettings);
     const groups = (settings.hooks as Record<string, unknown[]>).SessionStart;
     const entries = groups.flatMap((g) => ((g as { hooks?: unknown[] }).hooks ?? []) as unknown[]);
     expect(entries.length).toBe(1); // marker dedupe, not accumulation
     expect((settings.permissions as { allow: string[] }).allow).toEqual(['mcp__gbrain']);
     expect(readFileSync(f.codexConfig, 'utf8').split(CODEX_TOML_BLOCK_BEGIN).length - 1).toBe(1);
-    expect(readFileSync(f.codexConfig, 'utf8')).toContain(TOKEN_B);
+    expect(readFileSync(f.codexConfig, 'utf8')).toContain(f.minted[4].token);
+    expect(readFileSync(f.codexConfig, 'utf8')).not.toContain(TOKEN_B);
+    expect(await statusHarness(parseHarnessArgs(['--status']), f.deps)).toBe(0);
   });
 
   test('wiring failure leaves the OLD token unrevoked and the receipt retryable [C7/F1]', async () => {
     const f = makeFake();
     expect(await applyHarness(flags(), f.deps)).toBe(0);
-    const f2 = makeFake({ mcpAddCode: 1, mintQueue: [{ token: TOKEN_B, id: ID_B }] });
+    const priorIds = f.minted.map(m => m.id);
+    const f2 = makeFake({ mcpAddCode: 1, mintQueue: DEFAULT_MINT_QUEUE.slice(3) });
     // same home so the prior receipt is visible
     const deps: HarnessDeps = { ...f2.deps, gbrainHome: f.home, userSettingsPath: f.userSettings, codexConfig: f.codexConfig };
     const code = await applyHarness(flags(), deps);
@@ -302,7 +369,9 @@ describe('full apply', () => {
     expect(f2.revoked).toEqual([]); // old token still live
     const state = readHarnessReceiptState(f.home);
     const receipt = (state as { receipt: { targets: Array<{ state: string; kind: string }>; token: { previous_ids?: string[] } } }).receipt;
-    expect(receipt.token.previous_ids).toEqual([ID_A]); // kept for the next converge [X4]
+    expect(receipt.token.previous_ids).toEqual(priorIds);
+    expect(f2.minted).toHaveLength(3);
+    expect(f2.minted.every(m => !priorIds.includes(m.id))).toBe(true);
     expect(receipt.targets.some((t) => t.state === 'failed' && t.kind === 'mcp')).toBe(true);
   });
 
@@ -473,7 +542,7 @@ describe('--status', () => {
 
   test('green path: token recovered from the codex block, identity verified, exit 0', async () => {
     const f = makeFake({ mcpGet: () => ({ code: 1, stdout: '', stderr: 'nope' }) });
-    expect(await applyHarness(flags(), f.deps)).toBe(0);
+    expect(await applyHarness(flags(['--harness', 'codex']), f.deps)).toBe(0);
     const code = await statusHarness(parseHarnessArgs(['--status']), f.deps);
     expect(code).toBe(0);
     expect(f.out.join('\n')).toMatch(/token: OK .*codex config block/);
@@ -527,6 +596,130 @@ describe('outside-voice hardening (X-batch)', () => {
     const f2 = makeFake();
     expect(await applyHarness(flags(['--harness', 'codex']), f2.deps)).toBe(0);
     expect(f2.mintCalls[0].sourceGrant).toBeUndefined();
+  });
+
+  test('#4897 no --source: hooks, receipt and token bind to the serve\'s implicit default source', async () => {
+    // A brain whose only populated source is 'workspace' (default = 0 pages):
+    // the serve binds its resolve-IPC listener to 'workspace' via the same
+    // resolver, so a hook claiming 'default' is source_mismatch on every turn.
+    const f = makeFake({ implicitSource: 'workspace' });
+    expect(await applyHarness(flags(['--harness', 'claude-code']), f.deps)).toBe(0);
+    const hooks = readJson(f.userSettings).hooks as Record<string, unknown[]>;
+    const cmd = ((hooks.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
+    expect(cmd).toContain('GBRAIN_SOURCE=workspace');
+    expect(cmd).not.toContain('GBRAIN_SOURCE=default');
+    const state = readHarnessReceiptState(f.home) as { receipt: { source_id: string } };
+    expect(state.receipt.source_id).toBe('workspace');
+    // The token gets the same scalar grant `--source workspace` produces —
+    // the federated-default mint cannot read a non-federated sole source.
+    expect(f.mintCalls[0].sourceGrant).toEqual(['workspace']);
+    expect(f.out.join('\n')).toContain("source 'workspace'");
+
+    // Explicit --source still wins over the implicit default.
+    const f2 = makeFake({ implicitSource: 'workspace' });
+    expect(await applyHarness(flags(['--harness', 'claude-code', '--source', 'wiki']), f2.deps)).toBe(0);
+    const hooks2 = readJson(f2.userSettings).hooks as Record<string, unknown[]>;
+    const cmd2 = ((hooks2.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
+    expect(cmd2).toContain('GBRAIN_SOURCE=wiki');
+    expect(f2.mintCalls[0].sourceGrant).toEqual(['wiki']);
+    expect((readHarnessReceiptState(f2.home) as { receipt: { source_id: string } }).receipt.source_id).toBe('wiki');
+  });
+
+  test("#4897 implicit 'default' is the federated floor, not a scalar grant (wave review)", async () => {
+    // `sources.default = default` is a valid config value: the resolver echoes
+    // it back, but it means "the seeded default" — the same thing the absent
+    // case means. Binding the token to a scalar ['default'] grant would hide
+    // every federated source from the hook lane (allowedSources set → no span).
+    const f = makeFake({ implicitSource: 'default' });
+    expect(await applyHarness(flags(['--harness', 'claude-code']), f.deps)).toBe(0);
+    expect(f.mintCalls[0].sourceGrant).toBeUndefined();
+    const hooks = readJson(f.userSettings).hooks as Record<string, unknown[]>;
+    const cmd = ((hooks.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
+    expect(cmd).toContain('GBRAIN_SOURCE=default');
+    expect((readHarnessReceiptState(f.home) as { receipt: { source_id: string } }).receipt.source_id).toBe('default');
+    expect(f.out.join('\n')).not.toContain('binding hooks + token');
+  });
+
+  // Wave review: the hook lane binds through the SAME resolver the serve
+  // runs, an ambient non-default source carries its federated read set, and
+  // a failed lookup is never papered over with 'default'.
+  test("a typo'd --source fails loudly before any mint or receipt (wave review)", async () => {
+    const f = makeFake({
+      hookSourceError: new SourceTargetError('Source "wikk" not found or is archived. Available active sources: run `gbrain sources list`.'),
+    });
+    await expect(applyHarness(flags(['--harness', 'codex', '--source', 'wikk']), f.deps)).rejects.toThrow(/wikk/);
+    expect(f.mintCalls).toHaveLength(0);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('no --source and the lookup fails: refuse with "pass --source" instead of binding default (wave review)', async () => {
+    const f = makeFake({ hookSourceError: new Error('PGLite data dir is held by a live serve') });
+    await expect(applyHarness(flags(['--harness', 'codex']), f.deps)).rejects.toThrow(/pass --source/);
+    expect(f.mintCalls).toHaveLength(0);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('explicit --source with an unopenable engine binds unverified, with a warning (the --token + live-serve path)', async () => {
+    const f = makeFake({ hookSourceError: new Error('PGLite data dir is held by a live serve') });
+    expect(await applyHarness(flags(['--harness', 'codex', '--source', 'wiki']), f.deps)).toBe(0);
+    expect(f.mintCalls[0].sourceGrant).toEqual(['wiki']);
+    expect(f.err.join('\n')).toContain("could not verify --source 'wiki'");
+  });
+
+  // CI e2e (bootstrap-harness-lifecycle): under a LIVE PGLite serve the
+  // documented --token lane must keep working without --source, and the
+  // no-token case must surface the mint's two escape hatches, not a
+  // source-resolution error for what is a lock problem.
+  test('live PGLite serve + no token + no --source: the LIVE_SERVE refusal with both escape hatches, before any mint', async () => {
+    const f = makeFake({
+      pgliteLive: true,
+      hookSourceError: new Error("GBrain's local database is already open through `gbrain serve` (MCP, PID 4242)."),
+    });
+    await expect(applyHarness(flags(['--harness', 'codex']), f.deps)).rejects.toThrow(/pre-mint.*--token|stop the serve/);
+    await expect(applyHarness(flags(['--harness', 'codex']), f.deps)).rejects.not.toThrow(/pass --source/);
+    expect(f.mintCalls).toHaveLength(0);
+    expect(readHarnessReceiptState(f.home)).toEqual({ state: 'absent' });
+  });
+
+  test('live PGLite serve + --token + no --source: wires unpinned with a warning (the documented PGLite lane)', async () => {
+    const f = makeFake({
+      pgliteLive: true,
+      hookSourceError: new Error("GBrain's local database is already open through `gbrain serve` (MCP, PID 4242)."),
+    });
+    expect(await applyHarness(flags(['--harness', 'claude-code', '--token', TOKEN_A]), f.deps)).toBe(0);
+    expect(f.mintCalls).toHaveLength(0);
+    expect(f.err.join('\n')).toMatch(/could not read which source it serves/);
+    expect(f.err.join('\n')).toMatch(/--source <id>/);
+    const hooks = readJson(f.userSettings).hooks as Record<string, unknown[]>;
+    const cmd = ((hooks.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
+    expect(cmd).not.toContain('GBRAIN_SOURCE=');
+    const receipt = (readHarnessReceiptState(f.home) as { receipt: { source_id: string; source_pinned?: boolean } }).receipt;
+    expect(receipt.source_id).toBe('default');
+    expect(receipt.source_pinned).toBe(false);
+  });
+
+  test('a pinned install records no source_pinned flag (absent = pinned to source_id)', async () => {
+    const f = makeFake({ implicitSource: 'workspace', implicitGrant: ['default', 'workspace'] });
+    expect(await applyHarness(flags(['--harness', 'claude-code']), f.deps)).toBe(0);
+    const receipt = (readHarnessReceiptState(f.home) as { receipt: { source_id: string; source_pinned?: boolean } }).receipt;
+    expect(receipt.source_id).toBe('workspace');
+    expect(receipt.source_pinned).toBeUndefined();
+  });
+
+  test('--token with a NON-live-serve lookup failure still refuses with "pass --source" (fail-closed stays for real errors)', async () => {
+    const f = makeFake({ hookSourceError: new Error('connection refused: postgres is down') });
+    await expect(applyHarness(flags(['--harness', 'codex', '--token', TOKEN_A]), f.deps)).rejects.toThrow(/pass --source/);
+    expect(f.mintCalls).toHaveLength(0);
+  });
+
+  test('implicit non-default source: the token grant is its federated read set, not a scalar (wave review)', async () => {
+    const f = makeFake({ implicitSource: 'workspace', implicitGrant: ['default', 'workspace'] });
+    expect(await applyHarness(flags(['--harness', 'claude-code']), f.deps)).toBe(0);
+    expect(f.mintCalls[0].sourceGrant).toEqual(['default', 'workspace']);
+    const hooks = readJson(f.userSettings).hooks as Record<string, unknown[]>;
+    const cmd = ((hooks.SessionStart[0] as { hooks: Array<{ command: string }> }).hooks[0]).command;
+    expect(cmd).toContain('GBRAIN_SOURCE=workspace');
+    expect((readHarnessReceiptState(f.home) as { receipt: { source_id: string } }).receipt.source_id).toBe('workspace');
   });
 
   test('[X3] --no-capture RE-RUN unwires the capture events it previously wired', async () => {
@@ -657,8 +850,70 @@ describe('outside-voice hardening (X-batch)', () => {
       },
     };
     const code = await statusHarness(parseHarnessArgs(['--status']), statusDeps);
-    expect(f.out.join('\n')).toMatch(/verify unavailable/);
-    expect(code).toBe(0); // honest degrade, all targets confirmed
+    const out = f.out.join('\n');
+    expect(out).toMatch(/verify unavailable/);
+    expect(out).not.toContain(TOKEN_B);
+    // #4586: the live registration no longer points at OUR serve — the target
+    // line and the exit code say so instead of replaying the receipt's
+    // apply-time 'confirmed'.
+    expect(out).toMatch(/claude-code\/mcp \(user\): failed — .*127\.0\.0\.1:9999.*--force/);
+    expect(code).toBe(1);
+  });
+
+  test('#4586 --status: a user-scope registration replaced by a stdio serve reads failed (human + --json), receipt untouched', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(['--harness', 'claude-code', '--no-hooks']), f.deps)).toBe(0);
+    const deps: HarnessDeps = {
+      ...f.deps,
+      runner: async (argv: string[]) => {
+        if (argv[0] === 'claude' && argv[2] === 'get') {
+          // `bootstrap hooks --scope user` / a manual `claude mcp add` took the
+          // name over at OUR scope with a stdio launch: no URL line at all.
+          return {
+            code: 0,
+            stdout: 'gbrain:\n  Scope: User config\n  Type: stdio\n  Command: /usr/local/bin/gbrain\n  Args: serve --surface full\n',
+            stderr: '',
+          };
+        }
+        return { code: 0, stdout: '', stderr: '' };
+      },
+    };
+    expect(await statusHarness(parseHarnessArgs(['--status']), deps)).toBe(1);
+    expect(f.out.join('\n')).toMatch(/claude-code\/mcp \(user\): failed — .*stdio/);
+
+    f.out.length = 0;
+    expect(await statusHarness(parseHarnessArgs(['--status', '--json']), deps)).toBe(1);
+    const payload = JSON.parse(f.out[f.out.length - 1]) as {
+      token_verified: unknown;
+      targets: Array<{ host: string; kind: string; state: string }>;
+    };
+    expect(payload.targets.find((t) => t.host === 'claude-code' && t.kind === 'mcp')?.state).toBe('failed');
+    expect(payload.token_verified).toBe('unavailable');
+    // Status is read-only: the receipt still carries the apply-time state.
+    const state = readHarnessReceiptState(f.home) as { receipt: { targets: HarnessTarget[] } };
+    expect(state.receipt.targets.find((t) => t.host === 'claude-code' && t.kind === 'mcp')?.state).toBe('confirmed');
+  });
+
+  test('#4586 negative control: a PROJECT-scope stdio entry (default `bootstrap hooks` shadow) leaves the user-scope target confirmed, exit 0', async () => {
+    const f = makeFake();
+    expect(await applyHarness(flags(['--harness', 'claude-code', '--no-hooks']), f.deps)).toBe(0);
+    const deps: HarnessDeps = {
+      ...f.deps,
+      runner: async (argv: string[]) => {
+        if (argv[0] === 'claude' && argv[2] === 'get') {
+          return {
+            code: 0,
+            stdout: 'gbrain:\n  Scope: Project config (shared via .mcp.json)\n  Type: stdio\n  Command: /usr/local/bin/gbrain\n  Args: serve --surface full\n',
+            stderr: '',
+          };
+        }
+        return { code: 0, stdout: '', stderr: '' };
+      },
+    };
+    // Not positive evidence of replacement at OUR scope — a cwd-dependent
+    // shadow, not a takeover — so the receipt state stands (honest degrade).
+    expect(await statusHarness(parseHarnessArgs(['--status']), deps)).toBe(0);
+    expect(f.out.join('\n')).toMatch(/claude-code\/mcp \(user\): confirmed/);
   });
 
   test('canary impostor guard: an endpoint that accepts an INVALID credential fails the apply and the fresh mint is revoked', async () => {

@@ -29,6 +29,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { importFromContent } from '../import-file.ts';
+import { canonicalJson } from '../remediation-step.ts';
 import type { TranscriptAdapter, TranscriptFormat } from './types.ts';
 import { detectAdapter } from './detect.ts';
 import {
@@ -270,6 +271,12 @@ export async function runTranscriptsIngest(
           if (opts.dryRun) {
             outcome.statuses = rendered.parts.map(() => 'planned' as const);
             result.pages.planned += rendered.parts.length;
+            // #4762: a planned session is new work too, so the --limit gate
+            // above truncates the preview like the real run. A dry run cannot
+            // see hash-skips (no engine reads), so `--dry-run --limit N` shows
+            // the first N eligible sessions — an upper bound on what the write
+            // path would import.
+            newWorkSessions++;
           } else {
             // The RESOLVED base slug: identity dedup can resolve part 1 to an
             // EXISTING page under a different slug (same session id, changed
@@ -336,12 +343,24 @@ export async function runTranscriptsIngest(
                 // write so healthy re-runs stay write-free.
                 let needsRaw = true;
                 if (allSkipped) {
+                  // Active rows only: `allSkipped` means the import hash check
+                  // (which reads ACTIVE rows) just matched every page, so the
+                  // base page is alive here by construction — a tombstoned
+                  // page never reaches this branch (it reads as missing and is
+                  // re-imported, see the "resurrects the page" e2e). No
+                  // includeDeleted flag: the probe must never read through a
+                  // soft-delete the hash check did not.
                   const existing = await engine.getRawData(resolvedBaseSlug, rawSource, {
                     sourceId: opts.sourceId,
                   });
+                  // Key-order-insensitive compare: JSONB hands keys back in
+                  // its own canonical order, so a plain JSON.stringify never
+                  // matched the freshly built object and every healthy re-run
+                  // rewrote the row.
                   needsRaw =
                     existing.length === 0 ||
-                    JSON.stringify(existing[0].data) !== JSON.stringify(redacted.session.meta.raw);
+                    canonicalJson(existing[0].data) !==
+                      canonicalJson(JSON.parse(JSON.stringify(redacted.session.meta.raw)));
                 }
                 if (needsRaw) {
                   await engine.putRawData(resolvedBaseSlug, rawSource, redacted.session.meta.raw, {

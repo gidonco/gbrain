@@ -76,6 +76,9 @@ export async function writeSingleFact(
   sourceId: string,
   input: SingleFactInput,
 ): Promise<SingleFactResult> {
+  const { assertCoordinatedWrite } = await import('../persistence/context.ts');
+  await assertCoordinatedWrite(engine, sourceId);
+
   const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
   const { cosineSimilarity } = await import('./classify.ts');
   const { writeFactsToFence, lookupSourceLocalPath } = await import('./fence-write.ts');
@@ -85,6 +88,12 @@ export async function writeSingleFact(
   const kind = input.kind ?? 'fact';
   const visibility = input.visibility ?? 'private';
   const validUntil = input.validUntil ?? null;
+  const { isFactWithdrawn } = await import('./withdrawal.ts');
+  if (await isFactWithdrawn(engine, sourceId, visibility, factText)) {
+    const { verbError } = await import('../ops/contract.ts');
+    throw verbError('invalid_params', 'fact_withdrawn: this exact claim was explicitly forgotten in this source and visibility.',
+      'Remember a corrected claim. Repeating the old claim does not restore withdrawn memory.');
+  }
 
   // #4755: normalize null-like entity refs to ABSENT before resolution so
   // the `resolved?.slug ?? entityRef` fallback can never adopt "null" as a

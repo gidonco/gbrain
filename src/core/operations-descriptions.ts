@@ -19,8 +19,10 @@
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const GET_RECENT_SALIENCE_DESCRIPTION =
-  "Returns pages recently touched and ranked by emotional + activity salience " +
-  "(deterministic 0..1 emotional_weight + take density + recency decay). " +
+  "Returns readable pages recently touched and ranked by activity salience and recency. " +
+  "Unrestricted local reads include deterministic 0..1 emotional_weight, take density, and recency decay. " +
+  "Holder-restricted reads count only permitted active takes, use zero emotional_weight, " +
+  "and select recent pages by updated_at; unrestricted local reads retain take-driven touches. " +
   "Use this when the user asks what's been going on, what's notable, what's hot, " +
   "anything crazy happening, or for any open-ended 'current state' question " +
   "about themselves or their work. Do NOT run a semantic search for these — " +
@@ -100,13 +102,15 @@ export const SEARCH_DESCRIPTION =
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const FIND_CONTRADICTIONS_DESCRIPTION =
-  "v0.32.6 — return suspected-contradiction findings from the most recent " +
+  "Stored contradiction reports are temporarily available only to trusted local callers without a source filter. " +
+  "Remote or source-scoped callers receive {contradictions: [], note} with an availability note. " +
+  "For eligible local callers, return suspected-contradiction findings from the most recent " +
   "`gbrain eval suspected-contradictions` probe run, optionally filtered by slug " +
   "and/or severity. Use this when the user asks 'what's inconsistent in my " +
   "brain', 'show me contradictions about Acme', 'high-severity issues only', or " +
   "wants to act on the probe's findings without re-running it. Returns " +
   "{contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. " +
-  "Reads the cached run row — does NOT trigger a new probe; users run " +
+  "An eligible read loads the stored run without triggering a new probe; users run " +
   "`gbrain eval suspected-contradictions` for that.";
 
 export const FIND_TRAJECTORY_DESCRIPTION =
@@ -189,9 +193,11 @@ export const LIST_SKILLS_DESCRIPTION =
   "CAN vs CANNOT call given this server + your access). To actually use a skill, " +
   "call get_skill with its name, read the returned prose, and follow it — calling " +
   "the correspondingly-named tools on THIS server. The response also carries an " +
-  "`instructions` envelope explaining this protocol. Reflects the serving repo's " +
-  "skills even when the call targets a mounted brain. Read-scope; published only " +
-  "when the brain owner enabled mcp.publish_skills.";
+  "`instructions` envelope explaining this protocol. On a shared brain, use " +
+  "schema_version:2 for source-qualified identities, immutable revisions, " +
+  "pagination and complete declared requirements. Only authorized sources and " +
+  "owner-approved file classes are visible; pre-migration servers retain their " +
+  "legacy prose catalog. Read-scope; published only when the brain owner enabled mcp.publish_skills.";
 
 export const GET_SKILL_DESCRIPTION =
   "Fetch one skill's full instructions by name. Returns `{name, frontmatter " +
@@ -202,7 +208,10 @@ export const GET_SKILL_DESCRIPTION =
   "instructions plus your tool calls back to this server. Tools listed in " +
   "`unavailable_tools` won't work for you (not exposed here, or beyond your " +
   "access) — adapt accordingly. Size-capped; read-scope; requires the owner to " +
-  "have enabled mcp.publish_skills.";
+  "have enabled mcp.publish_skills. On a shared brain, pass schema_version:2 " +
+  "with qualified_id and revision from discovery to fetch exact instructions " +
+  "and their approved dependency manifest. get_skill_asset retrieves declared " +
+  "files from that revision as data; downloading never grants execution or tool permissions.";
 
 /**
  * The load-bearing `instructions` envelope for list_skills. Pinned so the

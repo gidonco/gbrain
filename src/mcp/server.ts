@@ -14,9 +14,15 @@ import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
 import { gcSessionContextState } from '../core/context/session-state.ts';
 import { bindResolveIpcForServe } from './resolve-ipc-binding.ts';
+import { createPersistenceIpcProvider } from '../core/persistence/provider.ts';
 import { resolveMcpInstructions } from './instructions.ts';
+import { installCapabilitiesResource, mcpAdministrationGuidance } from './capabilities.ts';
+import { createSkillResources } from './skill-resources.ts';
+import { operationScopesAllowed } from '../core/scope.ts';
+import { readLocalWriter, verifyLocalWriter } from '../core/persistence/identity.ts';
 import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
 import { isEngineDegraded, onEngineRecovered } from '../core/degraded-marker.ts';
+import { assertStdioSourceBindable } from './source-preflight.ts';
 
 export async function resolveMcpStdioSourceScope(
   engine: BrainEngine,
@@ -126,6 +132,16 @@ export async function stdioVisibleTools(
   engine: BrainEngine,
   surfacedOps: Operation[],
 ): Promise<Operation[]> {
+  if (surfacedOps.some(op => op.requiredScopes?.length)) {
+    let scopes: readonly string[] = [];
+    if (!isEngineDegraded(engine)) {
+      try {
+        const verified = await verifyLocalWriter(engine, await readLocalWriter(engine, 'stdio'));
+        if (verified.remote) scopes = verified.grant.scopes;
+      } catch {}
+    }
+    surfacedOps = surfacedOps.filter(op => !op.requiredScopes?.length || operationScopesAllowed(scopes, op));
+  }
   if (!surfacedOps.some(op => op.publishGateKey)) return surfacedOps;
   // Degraded serve (db-availability 4c): fail-closed WITHOUT touching the
   // engine. The gate read below can hit engine.getConfig, which on the
@@ -173,6 +189,9 @@ export async function trackStdioRpc<T>(work: () => Promise<T>): Promise<T> {
 
 export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpSurface; sourceGuard?: boolean } = {}) {
   const config = loadConfig();
+  // Refuse to serve a well-formed GBRAIN_SOURCE that no active source row
+  // backs (see source-preflight.ts). Throws before any transport is attached.
+  await assertStdioSourceBindable(engine);
   // MEMORY_VERBS v1 surface mode: 'full' (default — every op, byte-identical
   // to pre-surface behavior), 'starter' (WP4 daily-driver set), or 'verbs'
   // (exactly the 7 protocol verbs). Enforced BOTH on the advertised list and
@@ -205,7 +224,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     // op on engine failure) and caches it — recovery sends the notification
     // so the full catalog comes back without a harness restart.
     {
-      capabilities: { tools: { listChanged: true } },
+      capabilities: { tools: { listChanged: true }, resources: {} },
       // #4748: canonical contract (+ opt-in ambient-writeback section) plus the
       // optional operator-set deployment identity, appended last.
       instructions: resolveMcpInstructions(config, process.env, {
@@ -218,6 +237,28 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
   );
 
   // WP3: strict-params schema emission, resolved ONCE at startup from the
+  installCapabilitiesResource(server, async () => {
+    const scope = await resolveMcpStdioSourceScope(engine);
+    const available = (await stdioVisibleTools(engine, surfacedOps)).map(op => op.name);
+    let scopes: readonly string[] = [];
+    if (!isEngineDegraded(engine)) {
+      try {
+        const verified = await verifyLocalWriter(engine, await readLocalWriter(engine, 'stdio'));
+        if (verified.remote) scopes = verified.grant.scopes;
+      } catch {}
+    }
+    return { transport: 'stdio', scopes, surface, source_id: scope.sourceId,
+      available_operations: available,
+      administration: mcpAdministrationGuidance(),
+      shared_skills: { protocol_version: 2, catalog: available.includes('list_skills') && available.includes('get_skill'),
+        can_join: available.includes('join_brain'), can_edit: available.includes('put_skill') && available.includes('delete_skill'), native_activation: 'unverified' },
+      worker: { status: 'unknown' }, note: 'This local MCP pipe has no OAuth profile; agent-facing operation restrictions still apply.' };
+  }, createSkillResources(engine, async () => {
+    const scope = await resolveMcpStdioSourceScope(engine);
+    return { remote: true, transport: 'stdio', sourceId: scope.sourceId,
+      localFederatedSourceIds: scope.localFederatedSourceIds, allowedOps, surface, config: config ?? undefined };
+  }));
+
   // FILE config plane only — stdio has no per-request list cycle, so a
   // `mcp.strict_params` flip needs a serve restart here (deliberate; the
   // OAuth HTTP path re-reads dual-plane per request).
@@ -321,6 +362,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     ipcBinding = await bindResolveIpcForServe(
       engine,
       (await resolveMcpStdioSourceScope(engine)).sourceId,
+      await createPersistenceIpcProvider(engine, config ?? { engine: engine.kind }),
     );
 
     // v0.45.7 ambient recall: age out stale session cursors once per serve boot

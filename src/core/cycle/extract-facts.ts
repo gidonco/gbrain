@@ -53,7 +53,10 @@
  * backlog through the sanctioned removal path instead of raw SQL.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
+
 import type { BrainEngine } from '../engine.ts';
+import { assertUnmanagedCanonicalWriter } from '../persistence/maintenance.ts';
 import { resolveSupersededByRow, type SupersedeTarget } from '../facts/supersede-resolve.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
@@ -70,6 +73,9 @@ import {
 } from './phantom-redirect.ts';
 import { embed, isAvailable } from '../ai/gateway.ts';
 import { isAborted } from '../abort-check.ts';
+import { parseMarkdown } from '../markdown.ts';
+import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
+import { acquirePageLock } from '../page-lock.ts';
 
 interface ExistingPageFact {
   // v0.46 (#3014) — the row's own fact id. Read so the supersession-drift
@@ -84,6 +90,12 @@ interface ExistingPageFact {
   // drifted and re-heals through the wipe+reinsert fallback.
   superseded_by: number | string | null;
   expired_at: Date | string | null;
+  // #4870 — fence cells the reconcile must honor. Both columns are NOT NULL
+  // enums whose CHECK matches the fence's validated values, so a plain
+  // equality compare cannot churn on case/format/NULL.
+  visibility: string;
+  notability: string;
+  has_embedding: boolean;
 }
 
 function factContentKey(fact: string, source: string | null | undefined): string {
@@ -103,6 +115,93 @@ function dedupeFactsByContentKey(facts: FenceExtractedFact[]): FenceExtractedFac
 }
 
 /**
+ * Destructive reconciliation may only trust the pages-table body when it
+ * still matches the canonical Markdown file. The fact writer deliberately
+ * commits Markdown first and then stamps the facts index, while page sync is
+ * asynchronous. In that gap a sweep can observe the old pages.compiled_truth
+ * plus the new fact row and otherwise delete the new row as "stale".
+ *
+ * `unavailable` preserves the existing DB-only/thin-client behaviour. A local
+ * canonical file that exists but cannot be read is fail-closed: destructive
+ * cleanup waits for a healthy sync/read instead of guessing that the cache is
+ * authoritative.
+ */
+async function canonicalCacheState(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+  cachedCompiledTruth: string,
+  cachedTimeline: string,
+): Promise<'fresh' | 'stale' | 'unavailable'> {
+  // sync.write_through=off: the fence writers already treat the file as
+  // non-canonical (fence-write.ts legacy fallback), so a stale mirror file must
+  // not block reconcile here either.
+  if (await isWriteThroughDisabled(engine)) return 'unavailable';
+  const target = await resolvePageWriteTarget(engine, slug, sourceId);
+  if (!target.ok || !existsSync(target.filePath)) return 'unavailable';
+  try {
+    const canonical = parseMarkdown(readFileSync(target.filePath, 'utf-8'), target.filePath);
+    return canonical.compiled_truth === cachedCompiledTruth.trim()
+      && canonical.timeline === cachedTimeline.trim()
+      ? 'fresh'
+      : 'stale';
+  } catch {
+    return 'stale';
+  }
+}
+
+async function refuseDestructiveReconcileOnStaleCache(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+  cachedCompiledTruth: string,
+  cachedTimeline: string,
+  warnings: string[],
+): Promise<boolean> {
+  const state = await canonicalCacheState(
+    engine,
+    slug,
+    sourceId,
+    cachedCompiledTruth,
+    cachedTimeline,
+  );
+  if (state !== 'stale') return false;
+  warnings.push(
+    `${slug}: FACTS_PAGE_CACHE_STALE: canonical Markdown differs from the pages cache; ` +
+    'refusing destructive fact reconciliation until gbrain sync refreshes the page index.',
+  );
+  return true;
+}
+
+/**
+ * Run one page's destructive reconcile under its page lock (5s, matching the
+ * fence writers in fence-write.ts / forget.ts). A lock still held past the
+ * deadline degrades to a FACTS_PAGE_LOCK_TIMEOUT warning for THAT page and a
+ * null result, so one wedged page cannot abort the remaining slugs of the
+ * phase run. Errors thrown by `fn` itself still propagate.
+ */
+async function underPageLock<T>(
+  slug: string,
+  fn: () => Promise<T>,
+  opts: ExtractFactsOpts,
+  warnings: string[],
+): Promise<T | null> {
+  const handle = await acquirePageLock(slug, { timeoutMs: 5_000, lockRoot: opts.pageLockRoot });
+  if (!handle) {
+    warnings.push(
+      `${slug}: FACTS_PAGE_LOCK_TIMEOUT: page lock held by another writer; ` +
+      'skipping destructive fact reconciliation for this page until the next run.',
+    );
+    return null;
+  }
+  try {
+    return await fn();
+  } finally {
+    await handle.release();
+  }
+}
+
+/**
  * Fence-owned DB rows for one page coordinate. Excludes `cli:`-origin
  * conversation facts (#1928) — they are not fence-owned, so they must
  * neither count as "stale" (which would force a wipe every cycle) nor
@@ -116,16 +215,9 @@ function dedupeFactsByContentKey(facts: FenceExtractedFact[]): FenceExtractedFac
  * wipe every cycle) nor mask a fence row from insertion. Mirrors the
  * preserveExpiredLegacy filter deleteFactsForPage applies on the wipe.
  *
- * Deliberate consequence: if the fence still carries the same
- * (claim, source) as an expired legacy row, the reconcile inserts it
- * as a fresh ACTIVE fence-owned row. That is the fence-is-canonical
- * contract working as documented — legacy DB-only forgets "DO NOT
- * survive rebuild" (see forget.ts header); suppressing the insert
- * would instead create silent fence↔DB divergence, the exact failure
- * mode the empty-fence guard exists to prevent. To durably forget
- * such a claim, forget the fence-owned row (forget_fact now takes the
- * fence path, which strikes the row through in markdown). The expired
- * legacy row survives alongside as the record of the earlier forget.
+ * An ordinary expired legacy row does not suppress a fresh canonical fence
+ * row. Explicit forget is different: its durable withdrawal record is
+ * enforced by the facts trigger and import overlay, even after index rebuild.
  */
 async function listExistingFactsForPage(
   engine: BrainEngine,
@@ -133,7 +225,8 @@ async function listExistingFactsForPage(
   sourceId: string,
 ): Promise<ExistingPageFact[]> {
   return engine.executeRaw<ExistingPageFact>(
-    `SELECT id, fact, source, row_num, superseded_by, expired_at
+    `SELECT id, fact, source, row_num, superseded_by, expired_at, visibility, notability,
+            embedding IS NOT NULL AS has_embedding
        FROM facts
       WHERE source_id = $1
         AND source_markdown_slug = $2
@@ -167,6 +260,8 @@ export interface ExtractFactsOpts {
    * under the worker's 30s force-evict instead of running to completion.
    */
   signal?: AbortSignal;
+  /** Override the shared page-lock directory for deterministic tests. */
+  pageLockRoot?: string;
 }
 
 export interface ExtractFactsResult {
@@ -264,6 +359,7 @@ export async function runExtractFacts(
   engine: BrainEngine,
   opts: ExtractFactsOpts = {},
 ): Promise<ExtractFactsResult> {
+  await assertUnmanagedCanonicalWriter(engine, 'legacy fact-fence reconciliation');
   const sourceId = opts.sourceId ?? 'default';
   const result: ExtractFactsResult = {
     pagesScanned: 0,
@@ -522,21 +618,65 @@ export async function runExtractFacts(
     const existingKeys = new Set(existing.map(f => factContentKey(f.fact, f.source)));
     const desiredByKey = new Map(extracted.map(f => [factContentKey(f.fact, f.source), f]));
 
+    const restrictions = existing.filter(fact => {
+      const desired = desiredByKey.get(factContentKey(fact.fact, fact.source));
+      return (fact.expired_at == null && (!desired || desired.expired_at != null))
+        || (fact.visibility !== 'private' && desired?.visibility === 'private');
+    });
+    if (restrictions.length > 0) {
+      const restricted = await underPageLock(slug, async () => {
+        if (await refuseDestructiveReconcileOnStaleCache(
+          engine, slug, sourceId, page.compiled_truth ?? '', page.timeline ?? '', result.warnings,
+        )) return null;
+        return engine.transaction(async tx => {
+          const current = await tx.getPage(slug, { sourceId });
+          if (!current || current.compiled_truth !== page.compiled_truth || current.timeline !== page.timeline) return null;
+          for (const fact of restrictions) {
+            const desired = desiredByKey.get(factContentKey(fact.fact, fact.source));
+            await tx.executeRaw(
+              `UPDATE facts SET expired_at=COALESCE(expired_at,$5::timestamptz),
+                 visibility=CASE WHEN $6 THEN 'private' ELSE visibility END
+               WHERE id=$1 AND source_id=$2 AND fact=$3 AND source IS NOT DISTINCT FROM $4`,
+              [fact.id, sourceId, fact.fact, fact.source,
+                !desired ? new Date() : desired.expired_at ?? null, desired?.visibility === 'private'],
+            );
+          }
+          return true;
+        });
+      }, opts, result.warnings);
+      if (!restricted) continue;
+    }
+
     if (extracted.length === 0) {
       if (existing.length > 0) {
-        // The delete targets source_markdown_slug = slug only, so
-        // NULL-source_markdown_slug legacy rows survive (the
-        // partial-UNIQUE-index keyspace). #1928: `cli:`-origin facts
-        // (conversation facts from extract-conversation-facts) are NOT
-        // fence-owned — the page carries no `## Facts` fence to recreate
-        // them — so they MUST survive this reconcile. #2646: soft-expired
-        // legacy rows (forget_fact's record of the forget) likewise
-        // survive via preserveExpiredLegacy.
-        const deleted = await engine.deleteFactsForPage(slug, sourceId, {
-          excludeSourcePrefixes: ['cli:'],
-          preserveExpiredLegacy: true,
-        });
-        result.factsDeleted += deleted.deleted;
+        const deletion = await underPageLock(slug, async () => {
+          if (await refuseDestructiveReconcileOnStaleCache(
+            engine,
+            slug,
+            sourceId,
+            page.compiled_truth ?? '',
+            page.timeline ?? '',
+            result.warnings,
+          )) {
+            return null;
+          }
+          // The delete targets source_markdown_slug = slug only, so
+          // NULL-source_markdown_slug legacy rows survive (the
+          // partial-UNIQUE-index keyspace). #1928: `cli:`-origin facts
+          // (conversation facts from extract-conversation-facts) are NOT
+          // fence-owned — the page carries no `## Facts` fence to recreate
+          // them — so they MUST survive this reconcile. #2646: soft-expired
+          // legacy rows (forget_fact's record of the forget) likewise
+          // survive via preserveExpiredLegacy.
+          return engine.deleteFactsForPage(slug, sourceId, {
+            excludeSourcePrefixes: ['cli:'],
+            preserveExpiredLegacy: true,
+          });
+        }, opts, result.warnings);
+        if (!deletion) {
+          continue;
+        }
+        result.factsDeleted += deletion.deleted;
       }
       continue;
     }
@@ -600,13 +740,26 @@ export async function runExtractFacts(
       const dbTargetId = f.superseded_by == null ? null : Number(f.superseded_by);
       return resolvedTargetId !== dbTargetId;
     });
+    // #4870 — a visibility / notability edit on an existing row leaves the
+    // content key, row_num and struck-state untouched, so none of the terms
+    // above fire and the edit was a silent no-op. Compare the two fence
+    // cells the parser already validates; the wipe+reinsert transports them.
+    // ponytail: confidence is skipped — it is a REAL column, so an equality
+    // compare would need the fence formatter to avoid float-noise churn;
+    // route it through formatConfidence if a confidence-edit report lands.
+    const hasAttributeDrift = existing.some(f => {
+      const desired = desiredByKey.get(factContentKey(f.fact, f.source));
+      return desired !== undefined
+        && (desired.visibility !== f.visibility || desired.notability !== f.notability);
+    });
 
     if (
       existing.length === extracted.length &&
       !hasStaleExisting &&
       !hasDuplicateExisting &&
       !hasRowNumDrift &&
-      !hasSupersessionDrift
+      !hasSupersessionDrift &&
+      !hasAttributeDrift
     ) {
       continue;
     }
@@ -622,7 +775,7 @@ export async function runExtractFacts(
     // conversation facts (#1928), and soft-expired legacy rows (#2646)
     // survive.
     let deleteForPageFirst: { slug: string; excludeSourcePrefixes: string[]; preserveExpiredLegacy: boolean } | undefined;
-    if (hasStaleExisting || hasDuplicateExisting || hasRowNumDrift || hasSupersessionDrift) {
+    if (hasStaleExisting || hasDuplicateExisting || hasRowNumDrift || hasSupersessionDrift || hasAttributeDrift) {
       deleteForPageFirst = { slug, excludeSourcePrefixes: ['cli:'], preserveExpiredLegacy: true };
       toInsert = extracted;
     }
@@ -641,10 +794,11 @@ export async function runExtractFacts(
           // #1972: forward the abort signal so a cancelled cycle's in-flight
           // batch embed (a network call) is itself abortable, not just the loop.
           const embeddings = await embed(texts, { abortSignal: opts.signal });
-          // Defensive: embed should return one vector per input; if the
-          // gateway returns a partial array (provider partial-batch retry
-          // returning fewer than requested), only fill what we have.
-          for (let i = 0; i < toInsert.length && i < embeddings.length; i++) {
+          if (embeddings.length !== toInsert.length || embeddings.some(vector =>
+            !vector?.length || !vector.every(Number.isFinite))) {
+            throw new Error('embedding provider returned an incomplete or invalid fact batch');
+          }
+          for (let i = 0; i < toInsert.length; i++) {
             toInsert[i].embedding = embeddings[i];
           }
         } catch (err) {
@@ -663,18 +817,59 @@ export async function runExtractFacts(
         // NULL-embedding rows with a clean green 'ok', hiding the degraded
         // consolidate/drift_score behavior until someone diffed the DB.
         result.warnings.push(
-          `${slug}: embedding gateway unavailable — ${toInsert.length} fact(s) inserted with NULL embedding (won't cluster in consolidate until re-embedded)`,
+          `${slug}: embedding gateway unavailable — ${toInsert.length} fact(s) need embeddings (NULL embeddings won't cluster in consolidate until re-embedded)`,
         );
       }
     }
 
+    if (isAborted(opts.signal)) {
+      result.warnings.push(`${slug}: fact reconciliation deferred after cancellation; existing rows preserved`);
+      break;
+    }
+    if (deleteForPageFirst && existing.some(fact => fact.has_embedding)
+      && toInsert.some(fact => !fact.embedding)) {
+      result.warnings.push(`${slug}: destructive fact reconciliation deferred; existing vectors preserved until embedding succeeds`);
+      continue;
+    }
+
     if (toInsert.length === 0) continue;
 
-    const inserted = await engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
-      toInsert,
-      { source_id: sourceId },
-      deleteForPageFirst ? { deleteForPageFirst } : undefined,
-    );
+    const insert = async () => {
+      try {
+        return await engine.transaction(async tx => {
+          opts.signal?.throwIfAborted();
+          const inserted = await tx.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
+            toInsert,
+            { source_id: sourceId },
+            deleteForPageFirst ? { deleteForPageFirst } : undefined,
+          );
+          opts.signal?.throwIfAborted();
+          return inserted;
+        });
+      } catch (error) {
+        if (!isAborted(opts.signal)) throw error;
+        result.warnings.push(`${slug}: fact reconciliation cancelled; transaction rolled back`);
+        return null;
+      }
+    };
+    const inserted = deleteForPageFirst
+      ? await underPageLock(slug, async () => {
+        if (isAborted(opts.signal)) return null;
+        if (await refuseDestructiveReconcileOnStaleCache(
+          engine,
+          slug,
+          sourceId,
+          page.compiled_truth ?? '',
+          page.timeline ?? '',
+          result.warnings,
+        )) {
+          return null;
+        }
+        if (isAborted(opts.signal)) return null;
+        return insert();
+      }, opts, result.warnings)
+      : await insert();
+    if (!inserted) continue;
     result.factsInserted += inserted.inserted;
     // v0.46 (#3014) — the wipe (when needed) ran inside insertFacts' txn;
     // count it here from the atomic result rather than a separate delete.

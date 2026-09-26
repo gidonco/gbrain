@@ -5,9 +5,8 @@
  *   1. The selected-e2e job exists, consumes scripts/select-e2e.ts in its
  *      default file-selection mode, and NOTHING masks the selector's exit
  *      code (exit 2 = git failure must fail the job — fail-loud).
- *   2. Both aggregation consumers (e2e-cache-write, e2e-status) carry the
- *      job in `needs` — a red selected lane can neither seal the content-
- *      hash cache marker nor report E2E green.
+ *   2. The e2e-status aggregate carries the job in `needs` and requires
+ *      success — a red selected lane cannot report E2E green.
  *   3. The job passes NO live provider keys, so it is fork-runnable by
  *      construction (service Postgres only) and can never spend tokens.
  *   4. The job's checkout fetches real history (select-e2e diffs
@@ -24,8 +23,11 @@
  *      never grow past the seeded literal.
  */
 import { describe, test, expect } from 'bun:test';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { E2E_EXCLUSIONS, prepareMatrix } from '../../scripts/e2e-matrix.ts';
 import { E2E_TEST_MAP } from '../../scripts/e2e-test-map.ts';
 
 const repoRoot = join(import.meta.dir, '..', '..');
@@ -42,26 +44,26 @@ function jobBlock(name: string): string {
 
 const LIVE_KEY_FILES = new Set([
   'test/e2e/skills.test.ts',
-  'test/e2e/zeroentropy-live.test.ts',
   'test/e2e/voyage-rerank-live.test.ts',
   'test/e2e/voyage-multimodal.test.ts',
 ]);
 
 describe('selected-e2e job wiring', () => {
   const job = jobBlock('selected-e2e');
+  const prep = jobBlock('prepare-e2e');
 
   test('consumes select-e2e with nothing masking its exit code', () => {
-    expect(job).toContain('bun scripts/select-e2e.ts');
-    const selectorLine = job.split('\n').find(l => l.includes('bun scripts/select-e2e.ts'))!;
+    expect(prep).toContain('bun scripts/select-e2e.ts');
+    expect(job).not.toContain('bun scripts/select-e2e.ts');
+    expect(job).toContain('bun scripts/e2e-matrix.ts run');
+    const selectorLine = prep.split('\n').find(l => l.includes('bun scripts/select-e2e.ts'))!;
     expect(selectorLine).not.toContain('|| true');
     expect(selectorLine).not.toContain('|| echo');
     expect(job).not.toContain('continue-on-error');
   });
 
-  test('cache-write and status both gate on the job', () => {
-    const cacheWrite = jobBlock('e2e-cache-write');
+  test('status gates on the job', () => {
     const status = jobBlock('e2e-status');
-    expect(cacheWrite).toContain('selected-e2e');
     expect(status).toContain('selected-e2e');
     expect(status).toContain('needs.selected-e2e.result');
     // The aggregate loop must actually check the result, not just need it.
@@ -69,19 +71,40 @@ describe('selected-e2e job wiring', () => {
   });
 
   test('fork-runnable: no live provider keys anywhere in the job block', () => {
-    for (const secret of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'ZEROENTROPY', 'VOYAGE_API_KEY', 'secrets.']) {
+    for (const secret of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'VOYAGE_API_KEY', 'secrets.']) {
       expect(job).not.toContain(secret);
     }
   });
 
   test('checkout fetches real history for the master diff', () => {
-    expect(job).toContain('fetch-depth: 0');
+    expect(prep).toContain('fetch-depth: 0');
+  });
+
+  test('selector emits separate lines so workflow exclusions retain other selected files', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-selector-wiring-'));
+    try {
+      const git = (args: string[]) => {
+        const result = spawnSync('git', args, { cwd: dir, encoding: 'utf8' });
+        expect(result.status, result.stderr).toBe(0);
+      };
+      git(['init', '-q']);
+      git(['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture', '--allow-empty']);
+      git(['update-ref', 'refs/remotes/origin/master', 'HEAD']);
+      mkdirSync(join(dir, 'test/e2e'), { recursive: true });
+      const files = ['test/e2e/mechanical.test.ts', 'test/e2e/route-a.test.ts', 'test/e2e/route-b.test.ts'];
+      for (const file of files) writeFileSync(join(dir, file), '// fixture\n');
+      const selected = spawnSync(process.execPath, ['--no-env-file', join(repoRoot, 'scripts/select-e2e.ts')], { cwd: dir, encoding: 'utf8' });
+      expect(selected.status, selected.stderr).toBe(0);
+      expect(selected.stdout).toBe(files.join('\n') + '\n');
+      const filtered = prepareMatrix(selected.stdout.trim().split('\n'), new Map());
+      expect(filtered.include.flatMap(row => row.files).sort()).toEqual(files.slice(1));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('every EXCLUDE entry is named by another job here or is a live-key spender', () => {
-    const m = job.match(/EXCLUDE='([^']+)'/);
-    expect(m).not.toBeNull();
-    const excluded = m![1].split(/\s+/).filter(Boolean);
+    const excluded = [...E2E_EXCLUSIONS];
     expect(excluded.length).toBeGreaterThan(0);
     const restOfWorkflow = yml.replace(job, '');
     for (const f of excluded) {
@@ -96,7 +119,7 @@ describe('selected-e2e job wiring', () => {
  * baseline shrinks (a file gets mapped or deleted), lower this constant IN
  * THE SAME COMMIT (the module-size ratchet's no-stale-slack convention).
  */
-const BASELINE_SEEDED_LENGTH = 153;
+const BASELINE_SEEDED_LENGTH = 150;
 
 describe('e2e file claim ratchet', () => {
   const mapped = new Set(Object.values(E2E_TEST_MAP).flat());
@@ -109,7 +132,7 @@ describe('e2e file claim ratchet', () => {
       .filter(f => f.endsWith('.test.ts'))
       .map(f => `test/e2e/${f}`);
     expect(files.length).toBeGreaterThan(150);
-    const orphans = files.filter(f => !mapped.has(f) && !yml.includes(f) && !baseline.has(f));
+    const orphans = files.filter(f => !mapped.has(f) && !yml.includes(f) && !E2E_EXCLUSIONS.has(f) && !baseline.has(f));
     if (orphans.length > 0) {
       throw new Error(
         `new e2e file(s) with no PR-time claim — map them in scripts/e2e-test-map.ts ` +
@@ -136,7 +159,7 @@ describe('e2e file claim ratchet', () => {
   });
 
   test('no redundant baseline entries: a mapped or workflow-named file must leave the baseline', () => {
-    const redundant = baselineEntries.filter(f => mapped.has(f) || yml.includes(f));
+    const redundant = baselineEntries.filter(f => mapped.has(f) || yml.includes(f) || E2E_EXCLUSIONS.has(f));
     if (redundant.length > 0) {
       throw new Error(
         `baseline row(s) already claimed by E2E_TEST_MAP or the workflow — ` +

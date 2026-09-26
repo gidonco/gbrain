@@ -14,6 +14,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 import { embedStaleForSource } from '../src/core/embed-stale.ts';
 import type { ChunkInput } from '../src/core/types.ts';
 
@@ -47,7 +48,7 @@ async function seedPageWithStaleChunks(slug: string, chunkCount: number): Promis
     token_count: 4,
     embedding: undefined, // NULL = stale
   }));
-  await engine.upsertChunks(slug, chunks);
+  await installFixtureChunks(engine, slug, chunks);
 }
 
 /** Deterministic fake embedder — returns unit-length 1536-dim vectors with
@@ -61,6 +62,16 @@ function fakeEmbedFn(texts: string[]): Promise<Float32Array[]> {
       return v;
     }),
   );
+}
+
+/** The model `upsertChunks` recorded for `slug`'s chunks (gateway-resolved in
+ *  this process). A signature must name it for the provenance stamp to land. */
+async function recordedModel(slug: string): Promise<string> {
+  const rows = await engine.executeRaw<{ model: string }>(
+    `SELECT cc.model FROM content_chunks cc JOIN pages p ON p.id = cc.page_id WHERE p.slug = $1 LIMIT 1`,
+    [slug],
+  );
+  return rows[0]!.model;
 }
 
 describe('embedStaleForSource', () => {
@@ -207,7 +218,7 @@ describe('embedStaleForSource', () => {
       title: 'b',
       compiled_truth: '# b\n\nseeded',
     }, { sourceId: 'other' });
-    await engine.upsertChunks(
+    await installFixtureChunks(engine,
       'b',
       Array.from({ length: 3 }, (_, i) => ({
         chunk_index: i,
@@ -240,7 +251,7 @@ describe('embedStaleForSource', () => {
       compiled_truth: 'mixed modality page',
     });
     const imgVec = new Float32Array(1024).fill(0.03);
-    await engine.upsertChunks('media/mixed-page', [
+    await installFixtureChunks(engine, 'media/mixed-page', [
       {
         chunk_index: 0,
         chunk_text: 'field-photo.jpg',
@@ -297,7 +308,7 @@ describe('contextual-retrieval wrapping on re-embed (#3507)', () => {
 
   async function seedWrappablePage(slug: string, title: string): Promise<void> {
     await engine.putPage(slug, { type: 'note', title, compiled_truth: 'seeded' });
-    await engine.upsertChunks(slug, [
+    await installFixtureChunks(engine, slug, [
       { chunk_index: 0, chunk_text: 'prose chunk about widgets', chunk_source: 'compiled_truth', token_count: 4 },
       { chunk_index: 1, chunk_text: 'const x = 1;', chunk_source: 'fenced_code', token_count: 4 },
     ]);
@@ -367,7 +378,7 @@ describe('signature invalidation is probe-gated (#4283)', () => {
   /** Seed a page with N EMBEDDED chunks stamped under `signature`. */
   async function seedEmbeddedPage(slug: string, chunkCount: number, signature: string): Promise<void> {
     await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: `# ${slug}` });
-    await engine.upsertChunks(slug, Array.from({ length: chunkCount }, (_, i) => ({
+    await installFixtureChunks(engine, slug, Array.from({ length: chunkCount }, (_, i) => ({
       chunk_index: i,
       chunk_text: `chunk ${i} of ${slug}`,
       chunk_source: 'compiled_truth',
@@ -390,8 +401,8 @@ describe('signature invalidation is probe-gated (#4283)', () => {
     expect(await embeddedCount()).toBe(4);
 
     const result = await embedStaleForSource(engine, 'default', {
-      embeddingSignature: 'zeroentropyai:zembed-1:1280',
-      embedFn: async () => { throw new Error('ZeroEntropy embedding requires ZEROENTROPY_API_KEY.'); },
+      embeddingSignature: 'fixture-provider:embedding-v1:1280',
+      embedFn: async () => { throw new Error('Fixture embedding requires FIXTURE_API_KEY.'); },
     });
 
     // Pre-fix: all 4 embeddings were stripped and the run reported done.
@@ -406,7 +417,7 @@ describe('signature invalidation is probe-gated (#4283)', () => {
     const result = await embedStaleForSource(engine, 'default', {
       // Signature claims 1280 dims but the embedder returns 1536-d vectors:
       // every post-NULL upsert would fail, so refuse to NULL at all.
-      embeddingSignature: 'zeroentropyai:zembed-1:1280',
+      embeddingSignature: 'fixture-provider:embedding-v1:1280',
       embedFn: fakeEmbedFn,
     });
     expect(await embeddedCount()).toBe(2);
@@ -417,9 +428,14 @@ describe('signature invalidation is probe-gated (#4283)', () => {
   test('working embedder → probe fires once, drifted chunks are invalidated, re-embedded, and counted', async () => {
     const { EMBED_PROBE_TEXT } = await import('../src/core/embed-stale.ts');
     await seedEmbeddedPage('p1', 3, 'old:model:1536');
+    // The re-embed stamps only a signature naming the model the vectors were
+    // actually written under (#4825), so the target names the recorded model.
+    const target = `${await recordedModel('p1')}:1536`;
+    await engine.executeRaw(`UPDATE content_chunks SET model = 'old:model'
+      WHERE page_id = (SELECT id FROM pages WHERE slug = 'p1' AND source_id = 'default')`);
     const seen: string[] = [];
     const result = await embedStaleForSource(engine, 'default', {
-      embeddingSignature: 'new:model:1536',
+      embeddingSignature: target,
       embedFn: async (texts) => {
         seen.push(...texts);
         return fakeEmbedFn(texts);
@@ -433,7 +449,7 @@ describe('signature invalidation is probe-gated (#4283)', () => {
     const sig = await engine.executeRaw<{ s: string | null }>(
       `SELECT embedding_signature AS s FROM pages WHERE slug = 'p1'`,
     );
-    expect(sig[0]!.s).toBe('new:model:1536');
+    expect(sig[0]!.s).toBe(target);
   });
 
   test('no signature drift → no probe call (no embed spend on the common path)', async () => {
@@ -487,7 +503,7 @@ describe('content-drift staleness via embedded_text_hash (#4246)', () => {
   /** Manufacture the damaged state: text rewritten under a kept vector. */
   async function seedDriftedPage(slug: string): Promise<void> {
     await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: 'seeded' });
-    await engine.upsertChunks(slug, [{
+    await installFixtureChunks(engine, slug, [{
       chunk_index: 0, chunk_text: `old body of ${slug}`, chunk_source: 'compiled_truth',
       token_count: 4, embedding: new Float32Array(1536).fill(0.3),
     }]);
@@ -523,7 +539,7 @@ describe('content-drift staleness via embedded_text_hash (#4246)', () => {
 
   test('NULL hash (pre-v133 rows) is grandfathered — no upgrade re-embed spike', async () => {
     await engine.putPage('legacy', { type: 'note', title: 'legacy', compiled_truth: 'seeded' });
-    await engine.upsertChunks('legacy', [{
+    await installFixtureChunks(engine, 'legacy', [{
       chunk_index: 0, chunk_text: 'legacy text', chunk_source: 'compiled_truth',
       token_count: 4, embedding: new Float32Array(1536).fill(0.4),
     }]);
@@ -551,7 +567,7 @@ describe('content-drift staleness via embedded_text_hash (#4246)', () => {
       `INSERT INTO sources (id, name, config) VALUES ('other-drift', 'other-drift', '{"federated":true}'::jsonb) ON CONFLICT (id) DO NOTHING`,
     );
     await engine.putPage('od', { type: 'note', title: 'od', compiled_truth: 'seeded' }, { sourceId: 'other-drift' });
-    await engine.upsertChunks('od', [{
+    await installFixtureChunks(engine, 'od', [{
       chunk_index: 0, chunk_text: 'other old', chunk_source: 'compiled_truth',
       token_count: 4, embedding: new Float32Array(1536).fill(0.5),
     }], { sourceId: 'other-drift' });
@@ -590,5 +606,73 @@ describe('embedStalePages (#4216 phase-end closure)', () => {
     const sig = await engine.executeRaw<{ s: string | null }>(
       `SELECT embedding_signature AS s FROM pages WHERE slug = 'wiki/target-page'`);
     expect(sig[0]!.s).toBe('test:model:1536');
+  });
+});
+
+// ────────────────────────────────────────────────────────────────
+// #4825 — listStaleChunks pages by ROW with no page alignment, so a page
+// whose chunks straddle a batch boundary is never wholly in one batch. The
+// old stamp gate compared the batch subset against the whole page and left
+// such pages unstamped forever (a NULL signature is grandfathered).
+// ────────────────────────────────────────────────────────────────
+
+describe('signature stamp for a page split across a cursor batch (#4825)', () => {
+  test('page straddling the batch boundary is stamped once its last chunk lands', async () => {
+    await engine.putPage('probe', { type: 'note', title: 'probe', compiled_truth: 'probe' });
+    await installFixtureChunks(engine, 'probe', [{
+      chunk_index: 0, chunk_text: 'probe', chunk_source: 'compiled_truth',
+      token_count: 1, embedding: new Float32Array(1536).fill(0.1),
+    }]);
+    const signature = `${await recordedModel('probe')}:1536`;
+
+    await seedPageWithStaleChunks('a', 1);
+    await seedPageWithStaleChunks('b', 2);
+    // Stale rows drain as (a.0, b.0) then (b.1): 'b' is never whole in one batch.
+    const result = await embedStaleForSource(engine, 'default', {
+      embedFn: fakeEmbedFn,
+      batchSize: 2,
+      embeddingSignature: signature,
+    });
+    expect(result.embedded).toBe(3);
+
+    const sigs = await engine.executeRaw<{ slug: string; s: string | null }>(
+      `SELECT slug, embedding_signature AS s FROM pages WHERE slug IN ('a', 'b') ORDER BY slug`,
+    );
+    expect(sigs.map((r) => r.s)).toEqual([signature, signature]);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────
+// wave review — the provenance stamp resolved the registry-active column on
+// EVERY page it stamped (a config round-trip per page per batch, from both
+// keyset drains). The drain now resolves it once (`resolveProvenanceStamp`)
+// and hands the stamp helper a ProvenanceStamp.
+// ────────────────────────────────────────────────────────────────
+describe('provenance stamp resolves the active embedding column once per drain', () => {
+  test('the config lookups the signature ADDS do not grow with the page count', async () => {
+    const orig = engine.executeRaw;
+    const calls: string[] = [];
+    engine.executeRaw = (async function(this: PGLiteEngine, sql: string, ...rest: any[]) {
+      calls.push(sql);
+      return orig.call(this, sql, ...(rest as []));
+    }) as any;
+    try {
+      // getChunks & co. resolve the column per call whether or not a
+      // signature is set, so measure what the signature adds at a FIXED
+      // page count: pre-fix that was one lookup per stamped page.
+      const configLookups = async (pages: number, signature?: string): Promise<number> => {
+        await resetPgliteState(engine);
+        for (let i = 0; i < pages; i++) await seedPageWithStaleChunks(`p${i}`, 1);
+        calls.length = 0;
+        await embedStaleForSource(engine, 'default', { embedFn: fakeEmbedFn, embeddingSignature: signature });
+        return calls.filter((sql) => sql.includes("'search_embedding_column'")).length;
+      };
+      const sig = 'new:model:1536';
+      const oneSigCost = (await configLookups(1, sig)) - (await configLookups(1));
+      const fourSigCost = (await configLookups(4, sig)) - (await configLookups(4));
+      expect(fourSigCost).toBe(oneSigCost);
+    } finally {
+      engine.executeRaw = orig;
+    }
   });
 });

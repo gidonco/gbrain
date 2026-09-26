@@ -121,7 +121,7 @@ describe('buildGatewayConfig config-plane API-key folding', () => {
   // #2662: voyage_api_key was accepted at the file plane (config.json) but
   // never folded into the gateway env, so daemons/launchd/MCP callers with
   // no process-env export silently failed multimodal embeds. Same fold
-  // pattern as zeroentropy/openrouter above.
+  // pattern as Voyage/openrouter above.
   test('voyage_api_key folds into gateway env as VOYAGE_API_KEY', async () => {
     await withEnv({ VOYAGE_API_KEY: undefined }, async () => {
       const cfg = buildGatewayConfig({
@@ -213,6 +213,15 @@ describe('buildGatewayConfig config-plane API-key folding', () => {
         expect(cfg.env.GOOGLE_GENERATIVE_AI_API_KEY).toBe('AIza-config-plane');
       },
     );
+  });
+
+  test('deepseek_api_key folds into gateway env as DEEPSEEK_API_KEY (#4808)', async () => {
+    await withEnv({ DEEPSEEK_API_KEY: undefined }, async () => {
+      const cfg = buildGatewayConfig({
+        deepseek_api_key: 'sk-deepseek-config-plane',
+      } as unknown as GBrainConfig);
+      expect(cfg.env.DEEPSEEK_API_KEY).toBe('sk-deepseek-config-plane');
+    });
   });
 
   // Recurring-class guard: EVERY *_api_key field declared in

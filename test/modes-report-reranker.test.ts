@@ -89,9 +89,10 @@ describe('formatModesText — reranker lines', () => {
       const text = _exports_for_test.formatModesText(report);
       expect(text).toContain(`Reranker: ${DEFAULT_RERANKER_MODEL} (enabled but NOT running)`);
       expect(text).toContain('VOYAGE_API_KEY');
-      expect(text).toContain(`reranker=${DEFAULT_RERANKER_MODEL} topNIn=25 autocut=true`); // balanced
+      // autocut is OFF in every bundle since the ranker wave's rule R2 receipt.
+      expect(text).toContain(`reranker=${DEFAULT_RERANKER_MODEL} topNIn=25 autocut=false`); // balanced
       expect(text).toContain('reranker=off topNIn=30 autocut=false'); // conservative
-      expect(text).toContain(`reranker=${DEFAULT_RERANKER_MODEL} topNIn=50 autocut=true`); // tokenmax
+      expect(text).toContain(`reranker=${DEFAULT_RERANKER_MODEL} topNIn=50 autocut=false`); // tokenmax
     });
     await withEnv({ VOYAGE_API_KEY: 'pa-test' }, async () => {
       gw({ VOYAGE_API_KEY: 'pa-test' });
@@ -109,8 +110,8 @@ describe('formatModesText — reranker lines', () => {
 
   test('a base-URL override on the gateway plane surfaces as self_hosted=true', async () => {
     await withEnv({ GBRAIN_HOME: emptyHome(), VOYAGE_API_KEY: undefined }, async () => {
-      gw({ ZEROENTROPY_API_KEY: 'zk' }, { base_urls: { zeroentropyai: 'http://127.0.0.1:8080/v1' } });
-      const report = await buildModesReport(engineWith({ 'search.reranker.model': 'zeroentropyai:zerank-2' }));
+      gw({ VOYAGE_API_KEY: 'zk' }, { base_urls: { voyage: 'http://127.0.0.1:8080/v1' } });
+      const report = await buildModesReport(engineWith({ 'search.reranker.model': 'voyage:rerank-2.5' }));
       expect(report.reranker_readiness!.self_hosted).toBe(true);
     });
   });

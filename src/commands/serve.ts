@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { isEngineDegraded as isEngineDegradedForServe } from '../core/degraded-marker.ts';
-import { startMcpServer, stdioRpcsInFlightCount } from '../mcp/server.ts';
+import { startMcpServer, stdioRpcsInFlightCount, resolveMcpStdioSourceScope } from '../mcp/server.ts';
 import { VERB_NAMES } from '../core/verbs.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
 import {
@@ -334,7 +334,7 @@ export async function runServe(
   // the MCP client log "Failed to parse JSONRPC message" for every line.
   redirectStdoutLoggingToStderr();
 
-  installStdioLifecycle(engine, args, opts);
+  const activateStdioIdleActivityTracking = installStdioLifecycle(engine, args, opts);
 
   const start = opts.startMcpServer ?? startMcpServer;
 
@@ -371,13 +371,19 @@ export async function runServe(
 
   try {
     await start(engine, { surface, ...(sourceGuard ? { sourceGuard } : {}) });
+    // `--stdio-idle-timeout` arms its timer during lifecycle installation,
+    // but its stdin activity listener must wait until startMcpServer has
+    // attached the MCP SDK transport listener. Attaching any `data` listener
+    // earlier flips stdin into flowing mode and can consume a fast client's
+    // initialize frame before the SDK sees it.
+    activateStdioIdleActivityTracking();
   } finally {
     if (bootDeadline) clearTimeout(bootDeadline);
   }
-  // startMcpServer's `await server.connect(transport)` resolves once the
-  // SDK has wired up its stdin 'data' listener; that listener keeps the
-  // event loop alive. We deliberately do NOT add `await new Promise(() =>
-  // {})` here — it would block this async frame and stop the lifecycle
+  // startMcpServer returns after the SDK has wired up its stdin 'data'
+  // listener (and completed its engine-dependent boot); that listener keeps
+  // the event loop alive. We deliberately do NOT add `await new Promise(()
+  // => {})` here — it would block this async frame and stop the lifecycle
   // hooks from being able to call process.exit() cleanly.
 }
 
@@ -433,7 +439,7 @@ function installStdioLifecycle(
   engine: BrainEngine,
   args: string[],
   opts: ServeOptions,
-): void {
+): () => void {
   const deps: StdioLifecycleDeps = {
     stdin: opts.stdin ?? process.stdin,
     signals: opts.signals ?? process,
@@ -448,6 +454,7 @@ function installStdioLifecycle(
   let shuttingDown = false;
   let parentWatchdog: unknown = null;
   let idleSweepTimer: unknown = null;
+  let activateIdleActivityTracking = (): void => {};
   const beginShutdown = (reason: string): void => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -658,8 +665,15 @@ function installStdioLifecycle(
       if (runner.isDelegatedSyncRunning()) return;
       // Lazy import keeps the sweep core off the serve boot path.
       const { runMaintenanceSweep } = await import('../core/sweep.ts');
+      // #4679: same source ladder as stdio dispatch and the startup sweep
+      // (GBRAIN_SOURCE > .gbrain-source dotfile > local_path > sources.default
+      // > …). Pre-fix `GBRAIN_SOURCE || 'default'` swept the wrong source on
+      // dotfile/local_path-scoped serves, so in-session MCP writes never got
+      // their links reconciled until a restart. Never throws (falls back to
+      // 'default'); degraded engines short-circuit without a DB touch.
+      const { sourceId } = await resolveMcpStdioSourceScope(e);
       await runMaintenanceSweep(e, {
-        sourceId: process.env.GBRAIN_SOURCE || 'default',
+        sourceId,
         budgetMs: IDLE_SWEEP_BUDGET_MS,
       });
       // Deferred-embed drain: delegated syncs always run noEmbed (the #2139
@@ -707,6 +721,7 @@ function installStdioLifecycle(
   const idleTimeoutSec = parseStdioIdleTimeout(args);
   if (idleTimeoutSec > 0) {
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let activityListenerAttached = false;
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(
@@ -716,12 +731,24 @@ function installStdioLifecycle(
       idleTimer.unref?.();
     };
     armIdle();
-    // Reset on every chunk. We can't observe SDK-parsed messages from
-    // here, but every JSON-RPC frame causes a 'data' event on stdin, so
-    // chunk-level granularity is sufficient.
-    deps.stdin.on('data', armIdle);
+    activateIdleActivityTracking = (): void => {
+      if (activityListenerAttached || shuttingDown) return;
+      activityListenerAttached = true;
+      // Reset on every chunk. We can't observe SDK-parsed messages from
+      // here, but every JSON-RPC frame causes a 'data' event on stdin, so
+      // chunk-level granularity is sufficient. This listener is activated
+      // only after startMcpServer returns: adding it during lifecycle install
+      // would put stdin in flowing mode before the SDK transport attaches and
+      // race away the initialize frame.
+      deps.stdin.on('data', armIdle);
+      // Restart the countdown now that activity can actually be observed,
+      // so boot time no longer eats into the idle window.
+      armIdle();
+    };
     deps.log(`GBrain MCP server: stdio idle timeout = ${idleTimeoutSec}s`);
   }
+
+  return activateIdleActivityTracking;
 }
 
 /**

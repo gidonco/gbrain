@@ -9,9 +9,10 @@
  * and both proceed, total spend = $8. That's the bug. The fix is atomic
  * check-and-reserve under pg_advisory_xact_lock.
  *
- * The lock key is hashed from client_id. Stale reservations expire after
- * `RESERVATION_TTL_MS`. Legacy OAuth reservations release their estimate;
- * daily AI governor reservations stay pessimistically charged.
+ * The lock key is hashed from client_id. Stale reservations (worker
+ * crashed before settle) become overdue after `RESERVATION_TTL_MS`.
+ * Their liability remains reserved until actual usage is reconciled: a
+ * timeout or UTC day change is not evidence that a provider did no work.
  *
  * Mirror of the rate-leases.ts pattern (the v0.15 rate-lease helper does
  * the same shape for outbound provider concurrency caps).
@@ -22,11 +23,14 @@ import type { BrainEngine } from '../engine.ts';
 import { sqlQueryForEngine } from '../sql-query.ts';
 import { BudgetExceededError } from '../spend-log.ts';
 
-/** Reservation TTL — six hours. This avoids releasing capacity while a slow
- *  provider call is still legitimately running. */
-export const RESERVATION_TTL_MS = 6 * 60 * 60 * 1000;
+/** Reservation TTL — 10 minutes. Long enough for a normal provider call;
+ *  an overdue hold stays charged until its outcome is known. */
+export const RESERVATION_TTL_MS = 10 * 60 * 1000;
 
-/** Internal client whose crashed calls must remain pessimistically charged. */
+/** Fork guardrail: client id used by the persistent daily AI governor
+ *  (src/core/budget/daily-budget.ts). Upstream keeps expired reservations
+ *  charged for every client, which gives this governor the pessimistic
+ *  crash accounting it needs. */
 export const DAILY_AI_BUDGET_CLIENT_ID = 'gbrain:daily-ai';
 
 /** Generate an int hash of client_id for pg_advisory_xact_lock. */
@@ -44,10 +48,13 @@ function clientLockKey(clientId: string): number {
 export interface ReserveOpts {
   clientId: string;
   estimatedCents: number;
-  capCents: number;
+  capCents: number | null;
+  estimateKnown?: boolean;
   model: string;
   provider: string;
   jobId?: number;
+  /** Trusted runtime recheck, run under the client lock before admitting IO. */
+  validateAdmission?: (tx: BrainEngine) => Promise<void>;
 }
 
 export interface Reservation {
@@ -56,18 +63,11 @@ export interface Reservation {
   ttlMs: number;
 }
 
-function timestampSqlValue(value: unknown): string {
-  if (value instanceof Date) return value.toISOString();
-  const parsed = new Date(String(value));
-  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : String(value);
-}
-
 /**
  * Atomic check-and-reserve. Under `pg_advisory_xact_lock(client_id_hash)`:
  *
  *   1. Sweep expired pending reservations for this client.
- *   2. SUM today's settled spend from mcp_spend_log + pending estimated
- *      from mcp_spend_reservations.
+ *   2. SUM today's settled spend + all unresolved reservations, across dates.
  *   3. If `committed + pending + estimated > cap`, throw `BudgetExceededError`.
  *   4. INSERT pending reservation row with TTL.
  *   5. Return reservation id.
@@ -81,7 +81,7 @@ export async function reserve(
 ): Promise<Reservation> {
   assertNonEmpty('clientId', opts.clientId);
   assertFiniteNonNegative('estimatedCents', opts.estimatedCents);
-  assertFiniteNonNegative('capCents', opts.capCents);
+  if (opts.capCents !== null) assertFiniteNonNegative('capCents', opts.capCents);
   assertNonEmpty('model', opts.model);
   assertNonEmpty('provider', opts.provider);
   if (opts.jobId !== undefined && (!Number.isSafeInteger(opts.jobId) || opts.jobId <= 0)) {
@@ -92,35 +92,36 @@ export async function reserve(
   const lockKey = clientLockKey(opts.clientId);
   const expiresAt = new Date(Date.now() + RESERVATION_TTL_MS);
   const todayStart = todayStartIso();
-  await engine.transaction(async tx => {
-    if (tx.kind === 'postgres') {
-      await tx.executeRaw('SELECT pg_advisory_xact_lock($1)', [lockKey]);
-    }
+
+  await engine.transaction(async (tx) => {
     const sql = sqlQueryForEngine(tx);
 
-    // A crashed call is charged at its estimate. Never restore budget
-    // headroom merely because the caller disappeared before settlement.
-    const chargeExpiredEstimate = opts.clientId === DAILY_AI_BUDGET_CLIENT_ID;
-    const expired = await sql`
+    // Postgres can run several MCP requests for one client concurrently.
+    // Hold a transaction-scoped lock across sweep + read + insert so two
+    // callers cannot both observe the same headroom. PGLite serializes its
+    // single connection and does not implement advisory locks.
+    if (tx.kind === 'postgres') {
+      // Lock-census (PR6 D5): INTENTIONALLY per-client, not per-source — the budget cap is an oauth_clients.budget_usd_per_day property; one client's concurrent requests must serialize regardless of which source each targets.
+      await sql`SELECT pg_advisory_xact_lock(${BigInt(lockKey)})`;
+    }
+    // A cap tightened after the caller's preflight applies to this attempt.
+    // The row lock also serializes this admission with in-place grant repair.
+    const clients = await sql`SELECT budget_usd_per_day::text AS cap FROM oauth_clients WHERE client_id = ${opts.clientId} FOR SHARE`;
+    await opts.validateAdmission?.(tx);
+    const configuredCap = clients[0]?.cap == null ? null : Math.round(Number(clients[0].cap) * 100);
+    const cap = opts.capCents === null ? configuredCap : configuredCap === null ? opts.capCents : Math.min(opts.capCents, configuredCap);
+    if (cap !== null) assertFiniteNonNegative('configured cap', cap);
+
+    // Step 1: sweep expired reservations for this client.
+    await sql`
       UPDATE mcp_spend_reservations
-         SET status = 'expired',
-             actual_cents = CASE WHEN ${chargeExpiredEstimate} THEN estimated_cents ELSE 0 END,
-             settled_at = now()
+         SET status = 'expired'
        WHERE client_id = ${opts.clientId}
          AND status = 'pending'
          AND expires_at < now()
-      RETURNING client_id, estimated_cents, model, provider, created_at
     `;
-    for (const row of chargeExpiredEstimate ? expired : []) {
-      await sql`
-        INSERT INTO mcp_spend_log
-          (client_id, token_name, operation, spend_cents, provider, model, created_at)
-        VALUES
-          (${String(row.client_id)}, ${null}, 'expired_reservation',
-           ${Number(row.estimated_cents)}, ${String(row.provider)}, ${String(row.model)}, ${timestampSqlValue(row.created_at)})
-      `;
-    }
 
+    // Step 2 + 3: SUM committed + pending, refuse if over cap.
     const rows = await sql`
       SELECT
         COALESCE((
@@ -133,28 +134,32 @@ export async function reserve(
           SELECT SUM(estimated_cents)::text
             FROM mcp_spend_reservations
            WHERE client_id = ${opts.clientId}
-             AND status = 'pending'
-        ), '0') AS pending_text
+             AND status IN ('pending', 'expired')
+        ), '0') AS pending_text,
+        (SELECT count(*) FROM mcp_spend_reservations
+          WHERE client_id = ${opts.clientId} AND status IN ('pending','expired')
+            AND estimate_known = false) AS unknown_count
     `;
     const committedCents = requiredFiniteTotal(rows[0]?.committed_text, 'committed spend');
     const pendingCents = requiredFiniteTotal(rows[0]?.pending_text, 'pending spend');
     const totalProjected = committedCents + pendingCents + opts.estimatedCents;
-    if (totalProjected > opts.capCents) {
+    if (cap !== null && (opts.estimateKnown === false || Number(rows[0]?.unknown_count ?? 0) > 0 || totalProjected > cap)) {
       throw new BudgetExceededError(
         `budget exceeded for client ${opts.clientId}: ` +
         `committed=${committedCents.toFixed(2)}¢, pending=${pendingCents.toFixed(2)}¢, ` +
-        `estimated=${opts.estimatedCents.toFixed(2)}¢, cap=${opts.capCents.toFixed(2)}¢`,
-        Math.round(committedCents + pendingCents),
-        Math.round(opts.capCents),
+        `estimated=${opts.estimatedCents.toFixed(2)}¢, cap=${cap.toFixed(2)}¢; unresolved unknown usage remains reserved`,
+        committedCents + pendingCents,
+        cap,
       );
     }
 
+    // Step 4: INSERT reservation before releasing the client lock.
     await sql`
       INSERT INTO mcp_spend_reservations
-        (reservation_id, client_id, job_id, estimated_cents, model, provider, status, expires_at)
+        (reservation_id, client_id, job_id, estimated_cents, model, provider, status, expires_at, estimate_known, usage_unknown_reason)
       VALUES
         (${reservationId}, ${opts.clientId}, ${opts.jobId ?? null},
-         ${opts.estimatedCents}, ${opts.model}, ${opts.provider}, 'pending', ${expiresAt})
+         ${opts.estimatedCents}, ${opts.model}, ${opts.provider}, 'pending', ${expiresAt}, ${opts.estimateKnown !== false}, ${opts.estimateKnown === false ? 'pricing_or_bound_unknown' : null})
     `;
   });
 
@@ -192,10 +197,11 @@ export async function settle(
       UPDATE mcp_spend_reservations
          SET status = 'settled',
              actual_cents = ${actualCents},
+             usage_unknown_reason = NULL,
              settled_at = now()
        WHERE reservation_id = ${reservationId}
          AND status IN ('pending', 'expired')
-      RETURNING client_id, model, provider, created_at
+      RETURNING client_id, model, provider
     `;
     if (updated.length === 0) {
       const existing = await sql`
@@ -207,50 +213,34 @@ export async function settle(
       throw new Error(`spend reservation not found: ${reservationId}`);
     }
     const row = updated[0];
-    // Mirror into mcp_spend_log so getTodaySpendCents/reserve sees it. Preserve
-    // the reservation's created_at so a hold opened before UTC midnight settles
-    // against the day it belongs to (the daily governor's rollup depends on it).
+    // Mirror into mcp_spend_log so getTodaySpendCents/reserve sees it.
     await sql`
       INSERT INTO mcp_spend_log
-        (client_id, token_name, operation, spend_cents, provider, model, created_at)
+        (client_id, token_name, operation, spend_cents, provider, model)
       VALUES
         (${String(row.client_id)}, ${tokenName}, ${operation}, ${actualCents},
-         ${String(row.provider)}, ${String(row.model)}, ${timestampSqlValue(row.created_at)})
+         ${String(row.provider)}, ${String(row.model)})
     `;
   });
 }
 
 /**
- * Best-effort sweeper. Called by tests + the worker startup hook. Marks any
- * pending reservation past its TTL as 'expired'. Legacy OAuth reservations
- * release their estimate (actual_cents=0); daily AI governor reservations are
- * charged their estimate so crashed calls stay pessimistically counted.
+ * Sweeper called by tests + the worker startup hook. Marks any
+ * pending reservation past its TTL as 'expired'. This is an overdue marker,
+ * not a release: unknown usage stays NULL and counts against future admission.
  *
  * Returns the number of rows expired.
  */
 export async function sweepExpiredReservations(engine: BrainEngine): Promise<number> {
-  return engine.transaction(async tx => {
-    const sql = sqlQueryForEngine(tx);
-    const rows = await sql`
-      UPDATE mcp_spend_reservations
-         SET status = 'expired',
-             actual_cents = CASE WHEN client_id = ${DAILY_AI_BUDGET_CLIENT_ID} THEN estimated_cents ELSE 0 END,
-             settled_at = now()
-       WHERE status = 'pending'
-         AND expires_at < now()
-      RETURNING reservation_id, client_id, estimated_cents, model, provider, created_at
-    `;
-    for (const row of rows.filter(r => String(r.client_id) === DAILY_AI_BUDGET_CLIENT_ID)) {
-      await sql`
-        INSERT INTO mcp_spend_log
-          (client_id, token_name, operation, spend_cents, provider, model, created_at)
-        VALUES
-          (${String(row.client_id)}, ${null}, 'expired_reservation',
-           ${Number(row.estimated_cents)}, ${String(row.provider)}, ${String(row.model)}, ${timestampSqlValue(row.created_at)})
-      `;
-    }
-    return rows.length;
-  });
+  const sql = sqlQueryForEngine(engine);
+  const rows = await sql`
+    UPDATE mcp_spend_reservations
+       SET status = 'expired'
+     WHERE status = 'pending'
+       AND expires_at < now()
+    RETURNING reservation_id
+  `;
+  return rows.length;
 }
 
 /** Read the per-client cap from oauth_clients.budget_usd_per_day. Returns

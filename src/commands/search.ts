@@ -45,6 +45,7 @@ import {
 } from '../core/search/telemetry.ts';
 import {
   buildModesReport,
+  formatKnobValue,
   KNOB_DESCRIPTIONS,
   type SearchModesReport,
 } from '../core/search/modes-report.ts';
@@ -57,10 +58,13 @@ import {
 function formatModesText(report: SearchModesReport): string {
   const lines: string[] = [];
   lines.push('Search mode (active): ' + report.active_mode + (report.active_mode_valid ? '' : '  (unset — using balanced fallback)'));
+  lines.push(`Note: ${report.per_call_note}`);
   lines.push('');
   lines.push('Resolved knobs:');
   for (const [knob, attr] of Object.entries(report.resolved)) {
-    const value = String(attr.value ?? '(undefined)');
+    // null is a legitimate value for some knobs (expansion_variant_budget =
+    // legacy weighting, reranker_top_n_out = no truncate) — never '(undefined)'.
+    const value = formatKnobValue(knob, attr.value);
     lines.push(`  ${knob.padEnd(28)} = ${value.padEnd(12)} [${attr.source_detail}]`);
   }
   // v0.48.2 — one runtime line answering "is my reranker actually running?"
@@ -90,9 +94,6 @@ function formatModesText(report: SearchModesReport): string {
   for (const [k, desc] of Object.entries(KNOB_DESCRIPTIONS)) {
     lines.push(`  ${k.padEnd(28)} ${desc}`);
   }
-  // #4604: the dashboard shows brain-level resolution only.
-  lines.push('');
-  lines.push(`Note: ${report.per_call_note}`);
   return lines.join('\n');
 }
 

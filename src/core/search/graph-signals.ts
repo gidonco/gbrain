@@ -38,9 +38,10 @@
  * rates cross-process.
  */
 
-import type { SearchResult } from '../types.ts';
+import type { SearchResult, PageReadPolicy } from '../types.ts';
 import type { AdjacencyRow } from '../types.ts';
 import type { BrainEngine } from '../engine.ts';
+import { hasReadPolicy } from './read-policy-sql.ts';
 import { createAuditWriter } from '../audit/audit-writer.ts';
 
 // ===========================================================================
@@ -98,7 +99,7 @@ export interface GraphSignalsMeta {
   duration_ms: number;
 }
 
-export interface GraphSignalsOpts {
+export interface GraphSignalsOpts extends PageReadPolicy {
   /** Master gate. False short-circuits to no-op with zero-meta emitted. */
   enabled: boolean;
   /** Top-K size (default DEFAULT_TOP_K). */
@@ -198,6 +199,7 @@ const SESSION_MARKERS = new Set(['chat', 'session', 'sessions']);
 
 export function sessionPrefix(slug: string): string | null {
   if (!slug.includes('/')) return null;
+  if (slug.startsWith('atoms/')) return null;
   const segments = slug.split('/');
   // Strategy: walk segments left-to-right. Find the first segment that's
   // either a session marker (chat/session/sessions) OR a date prefix.
@@ -333,7 +335,7 @@ export async function applyGraphSignals(
   try {
     adjacency = opts.adjacencyFn
       ? await opts.adjacencyFn(uniquePageIds)
-      : await engine.getAdjacencyBoosts(uniquePageIds);
+      : await engine.getAdjacencyBoosts(uniquePageIds, hasReadPolicy(opts) ? opts : undefined);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     failureWriter.log({

@@ -9,7 +9,7 @@
  *      leaves a durable partial checkpoint (0 < bankedFiles < total) and does
  *      NOT advance the per-source `sources.last_commit` bookmark.
  *   2. SIGKILL is untrappable, so process-cleanup never runs and the
- *      per-source `gbrain_cycle_locks` row is STRANDED: holder pid dead, TTL
+ *      source and filesystem `gbrain_cycle_locks` rows are STRANDED: holder pid dead, TTL
  *      still live, heartbeat recent. Lock-reclaim mechanics under test
  *      (src/core/db-lock.ts:tryAcquireDbLock):
  *        - a fresh strand is NOT stealable — the upsert's ON CONFLICT gate
@@ -34,18 +34,20 @@
  * for the first banked op_checkpoint_paths row (GBRAIN_SYNC_CHECKPOINT_EVERY=1
  * banks after the first file), THEN sending SIGKILL. Never sleep-then-kill.
  *
- * Shared-DB etiquette: everything is scoped to a unique random source id; no
- * table is truncated; afterAll deletes only this suite's rows.
+ * Isolated-DB etiquette: fresh init gets a dedicated test database, then this
+ * legacy checkpoint/TTL-lock scenario uses DB-only sync within that database.
  *
  * Run: DATABASE_URL=... GBRAIN_TEST_ALLOW_DATABASE_URL=1 \
  *        bun test --timeout=180000 test/e2e/sync-sigkill-resume-postgres.test.ts
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'path';
 import { execSync } from 'child_process';
 import { tmpdir, hostname } from 'os';
+import postgres from 'postgres';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { loadOpCheckpoint, syncFingerprint } from '../../src/core/op-checkpoint.ts';
 import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
@@ -68,12 +70,17 @@ const TOTAL_PAGES = NEW_FILES + 1;
 
 let home: string;
 let repoDir: string;
+let filesystemLockKey: string;
 let engine: PostgresEngine;
 let commitA = '';
 let commitB = '';
 let ckptFingerprint = '';
 let killedPid = 0;
 let bankedAfterKill = 0;
+let isolatedUrl = '';
+let databaseName = '';
+let createdDatabase = false;
+let admin: ReturnType<typeof postgres> | undefined;
 /** Live child handle so afterAll can reap a leak if an assertion throws first. */
 let liveChild: ReturnType<typeof Bun.spawn> | null = null;
 
@@ -92,6 +99,8 @@ function baseEnv(extra: Record<string, string> = {}): Record<string, string> {
     'GBRAIN_SOURCE', 'GBRAIN_BRAIN_ID',
   ]) delete env[k];
   env.GBRAIN_HOME = home;
+  env.DATABASE_URL = isolatedUrl;
+  delete env.GBRAIN_DATABASE_URL;
   return { ...env, ...extra };
 }
 
@@ -155,6 +164,7 @@ async function bankedCount(): Promise<number> {
 }
 
 interface LockRow {
+  id: string;
   holder_pid: number;
   holder_host: string;
   ttl_expired: boolean;
@@ -162,16 +172,19 @@ interface LockRow {
   last_refreshed_at: unknown;
 }
 
-async function lockRow(): Promise<LockRow | null> {
-  const rows = await engine.executeRaw<LockRow>(
-    `SELECT holder_pid::int AS holder_pid, holder_host,
+function fixtureLockIds(): string[] {
+  return [LOCK_KEY, filesystemLockKey].sort();
+}
+
+async function lockRows(): Promise<LockRow[]> {
+  return engine.executeRaw<LockRow>(
+    `SELECT id, holder_pid::int AS holder_pid, holder_host,
             (ttl_expires_at < NOW()) AS ttl_expired,
             (EXTRACT(EPOCH FROM (NOW() - acquired_at)) * 1000)::float8 AS age_ms,
             last_refreshed_at
-       FROM gbrain_cycle_locks WHERE id = $1`,
-    [LOCK_KEY],
+       FROM gbrain_cycle_locks WHERE id = ANY($1::text[]) ORDER BY id`,
+    [fixtureLockIds()],
   );
-  return rows[0] ?? null;
 }
 
 async function sourceLastCommit(): Promise<string | null> {
@@ -187,9 +200,19 @@ async function sourceLastCommit(): Promise<string | null> {
 describeE2E('E2E: real SIGKILL mid-sync on Postgres — checkpoint bank, stranded lock, exactly-once resume', () => {
   beforeAll(async () => {
     assertSafeE2eDatabaseUrl(DATABASE_URL!);
+    databaseName = `gbrain_test_sigkill_${randomUUID().replaceAll('-', '')}`;
+    admin = postgres(DATABASE_URL!, { max: 1, prepare: false });
+    await admin.unsafe(`CREATE DATABASE ${databaseName}`);
+    createdDatabase = true;
+    const url = new URL(DATABASE_URL!);
+    url.pathname = `/${databaseName}`;
+    isolatedUrl = url.toString();
 
     home = mkdtempSync(join(tmpdir(), 'gbrain-sigkill-home-'));
     repoDir = mkdtempSync(join(tmpdir(), 'gbrain-sigkill-repo-'));
+    // The fixture is itself the Git worktree root, with no registered parent.
+    // Pin both locks independently of the lock implementation's helpers.
+    filesystemLockKey = `gbrain-fs:${createHash('sha256').update(JSON.stringify(realpathSync(repoDir))).digest('hex')}`;
 
     // Fixture repo, commit A: one seed file (establishes last_commit so the
     // killed run takes the INCREMENTAL checkpointed path, not first_sync).
@@ -203,40 +226,42 @@ describeE2E('E2E: real SIGKILL mid-sync on Postgres — checkpoint bank, strande
     execSync('git add -A && git commit -m "commit A: seed"', { cwd: repoDir, stdio: 'pipe' });
     commitA = git('rev-parse HEAD', repoDir);
 
-    // gbrain-owned config for the children: temp GBRAIN_HOME against the live
-    // Postgres (same pattern as test/e2e/thin-client.test.ts).
-    const init = await runCli(['init', '--non-interactive', '--no-embedding', '--url', DATABASE_URL!]);
+    const init = await runCli(['init', '--non-interactive', '--no-embedding', '--url', isolatedUrl]);
     if (init.exitCode !== 0) throw new Error(`init failed: ${init.stderr || init.stdout}`);
+
+    const legacy = new PostgresEngine();
+    await legacy.connect({ database_url: isolatedUrl });
+    try {
+      const [brain] = await legacy.executeRaw<{ enabled: boolean }>('SELECT enabled FROM persistence_brain WHERE singleton=1');
+      expect(brain.enabled).toBe(true);
+      await legacy.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    } finally {
+      await legacy.disconnect();
+    }
 
     const add = await runCli(['sources', 'add', SRC_ID, '--path', repoDir, '--no-federated']);
     if (add.exitCode !== 0) throw new Error(`sources add failed: ${add.stderr || add.stdout}`);
 
     // Parent poll/assert connection (schema already at latest via init above).
     engine = new PostgresEngine();
-    await engine.connect({ database_url: DATABASE_URL! });
+    await engine.connect({ database_url: isolatedUrl });
   }, 120_000);
 
   afterAll(async () => {
     if (liveChild && liveChild.exitCode === null && liveChild.signalCode === null) {
       try { liveChild.kill('SIGKILL'); await liveChild.exited; } catch { /* best-effort */ }
     }
-    // Shared DB: delete ONLY this suite's rows. facts FK to sources is ON
-    // DELETE RESTRICT, so clear it before the source row (cascades pages →
-    // chunks, and ingest_log).
-    if (engine) {
-      const cleanups: Array<[string, unknown[]]> = [
-        [`DELETE FROM facts WHERE source_id = $1`, [SRC_ID]],
-        [`DELETE FROM op_checkpoints WHERE op IN ('sync', 'sync-target') AND fingerprint = $1`, [ckptFingerprint || 'none']],
-        [`DELETE FROM gbrain_cycle_locks WHERE id = $1`, [LOCK_KEY]],
-        [`DELETE FROM sources WHERE id = $1`, [SRC_ID]],
-      ];
-      for (const [sql, params] of cleanups) {
-        try { await engine.executeRaw(sql, params); } catch { /* best-effort */ }
+    try {
+      if (engine) await engine.disconnect();
+    } finally {
+      try {
+        if (admin && createdDatabase) await admin.unsafe(`DROP DATABASE ${databaseName} WITH (FORCE)`);
+      } finally {
+        await admin?.end();
+        if (home) rmSync(home, { recursive: true, force: true });
+        if (repoDir) rmSync(repoDir, { recursive: true, force: true });
       }
-      await engine.disconnect();
     }
-    if (home) rmSync(home, { recursive: true, force: true });
-    if (repoDir) rmSync(repoDir, { recursive: true, force: true });
   }, 60_000);
 
   test('baseline: first sync converges and pins last_commit at commit A', async () => {
@@ -323,15 +348,17 @@ describeE2E('E2E: real SIGKILL mid-sync on Postgres — checkpoint bank, strande
     // (1) Bookmark frozen: last_commit did NOT advance.
     expect(await sourceLastCommit()).toBe(commitA);
 
-    // (2) The per-source lock row is STRANDED: held by the dead child's pid on
+    // (2) Both source and filesystem locks are STRANDED: held by the dead child's pid on
     // this host, TTL still live (30-min default), heartbeat recorded — SIGKILL
     // bypassed process-cleanup's release.
-    const lock = await lockRow();
-    expect(lock).not.toBeNull();
-    expect(lock!.holder_pid).toBe(killedPid);
-    expect(lock!.holder_host).toBe(hostname());
-    expect(lock!.ttl_expired).toBe(false);
-    expect(lock!.last_refreshed_at).not.toBeNull();
+    const locks = await lockRows();
+    expect(locks.map(lock => lock.id)).toEqual(fixtureLockIds());
+    for (const lock of locks) {
+      expect(lock.holder_pid).toBe(killedPid);
+      expect(lock.holder_host).toBe(hostname());
+      expect(lock.ttl_expired).toBe(false);
+      expect(lock.last_refreshed_at).not.toBeNull();
+    }
     // The holder really is dead (proc.exited resolved above reaps the child,
     // so a signal-0 probe gets ESRCH, not a zombie's success).
     let probeErr: NodeJS.ErrnoException | null = null;
@@ -343,39 +370,46 @@ describeE2E('E2E: real SIGKILL mid-sync on Postgres — checkpoint bank, strande
     // immediate retry is refused with the lock-busy error. Guard the premise
     // first so a pathologically slow runner fails loudly instead of flipping
     // the refusal into a reclaim.
-    expect(lock!.age_ms).toBeLessThan(40_000);
+    for (const lock of locks) expect(lock.age_ms).toBeLessThan(40_000);
     const busy = await runCli(['sync', '--source', SRC_ID, '--no-embed', '--no-pull']);
     expect(busy.exitCode).toBe(1);
     expect(busy.stderr).toContain('Another sync is in progress');
     expect(busy.stderr).toContain(String(killedPid));
     // The refused run changed nothing.
     expect(await sourceLastCommit()).toBe(commitA);
-    expect((await lockRow())!.holder_pid).toBe(killedPid);
+    const stillStranded = await lockRows();
+    expect(stillStranded.map(lock => lock.id)).toEqual(fixtureLockIds());
+    for (const lock of stillStranded) {
+      expect(lock.holder_pid).toBe(killedPid);
+      expect(lock.holder_host).toBe(hostname());
+    }
   }, 120_000);
 
   test('second sync reclaims the aged-out stranded lock via TTL + steal grace and converges exactly-once', async () => {
     expect(bankedAfterKill).toBeGreaterThan(0); // depends on the kill test
 
-    // Simulate the dead holder aging out (a killed process never refreshes:
+    // Simulate both dead-holder locks aging out (a killed process never refreshes:
     // its TTL lapses and last_refreshed_at drifts). Backdating the row is the
     // time-warp for the 30-min TTL; the steal grace is shrunk for real via the
     // documented env knob so the reclaim goes through tryAcquireDbLock's
     // production ON CONFLICT predicate:
     //   ttl_expires_at < NOW() AND last_refreshed_at < NOW() - grace.
-    await engine.executeRaw(
+    const aged = await engine.executeRaw<{ id: string }>(
       `UPDATE gbrain_cycle_locks
           SET ttl_expires_at = NOW() - INTERVAL '1 second',
               last_refreshed_at = NOW() - INTERVAL '10 minutes',
               acquired_at = acquired_at - INTERVAL '10 minutes'
-        WHERE id = $1`,
-      [LOCK_KEY],
+        WHERE id = ANY($1::text[]) AND holder_pid = $2 AND holder_host = $3
+        RETURNING id`,
+      [fixtureLockIds(), killedPid, hostname()],
     );
+    expect(aged.map(lock => lock.id).sort()).toEqual(fixtureLockIds());
 
     const r = await runCli(
       ['sync', '--source', SRC_ID, '--no-embed', '--no-pull'],
       { GBRAIN_LOCK_STEAL_GRACE_SECONDS: '60' },
     );
-    expect(r.exitCode).toBe(0);
+    expect(r.exitCode, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`).toBe(0);
     // It RESUMED the banked checkpoint (did not restart): the resume banner
     // reports exactly the rows banked before the kill.
     const combined = r.stdout + r.stderr;
@@ -408,7 +442,7 @@ describeE2E('E2E: real SIGKILL mid-sync on Postgres — checkpoint bank, strande
     );
     expect(Number(parents[0].n)).toBe(0);
 
-    // (3d) The reclaimed lock was released by withRefreshingLock's finally.
-    expect(await lockRow()).toBeNull();
+    // (3d) Both reclaimed locks were released by withRefreshingLock's finally.
+    expect(await lockRows()).toEqual([]);
   }, 120_000);
 });

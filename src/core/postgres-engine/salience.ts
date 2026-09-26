@@ -1,3 +1,4 @@
+import { pageReadFilter } from '../search/read-policy-sql.ts';
 /**
  * v0.29 — Salience + Anomaly Detection, peeled out of PostgresEngine
  * (containment sprint C15). Free functions over a NARROW deps surface —
@@ -87,22 +88,21 @@ export async function setEmotionalWeightBatch(deps: PgSalienceDeps, rows: Emotio
     // Composite-keyed UPDATE FROM unnest (codex C4#3): pages.slug is unique
     // only within a source, so a slug-only join would fan out across sources.
     //
-    // v0.29.1: bump salience_touched_at to NOW() ONLY when emotional_weight
-    // actually changes. The salience query window then includes the page in
-    // GREATEST(updated_at, salience_touched_at) >= boundary, so a previously
-    // calm page that just became salient surfaces in the recent salience
-    // results without a content edit. No-op writes (same weight) leave
-    // salience_touched_at alone — preserves "actual change" semantics.
+    // Only rows whose emotional_weight actually changes are rewritten (#4797):
+    // a same-value row is skipped entirely — no new tuple version, no per-row
+    // BEFORE UPDATE trigger fan-out (generation bump + search_vector), not
+    // counted in the return value. Every rewritten row bumps
+    // salience_touched_at to NOW() so the salience query window
+    // (GREATEST(updated_at, salience_touched_at) >= boundary) surfaces a
+    // previously calm page that just became salient without a content edit.
     const result = await sql`
       UPDATE pages
          SET emotional_weight = u.weight,
-             salience_touched_at = CASE
-               WHEN pages.emotional_weight IS DISTINCT FROM u.weight THEN now()
-               ELSE pages.salience_touched_at
-             END
+             salience_touched_at = now()
         FROM unnest(${slugs}::text[], ${sourceIds}::text[], ${weights}::real[])
           AS u(slug, source_id, weight)
        WHERE pages.slug = u.slug AND pages.source_id = u.source_id
+         AND pages.emotional_weight IS DISTINCT FROM u.weight
       RETURNING 1
     `;
     return result.length;
@@ -153,20 +153,27 @@ export async function getRecentSalience(deps: PgSalienceDeps, opts: SalienceOpts
         fallback: { halflifeDays: 1, coefficient: 1.0 },
       });
     }
+    const restricted = opts.takesHoldersAllowList !== undefined;
+    const emotionalSql = restricted ? '0' : 'p.emotional_weight';
+    const touchedSql = restricted ? 'p.updated_at' : 'GREATEST(p.updated_at, COALESCE(p.salience_touched_at, p.updated_at))';
+    const holderCondition = restricted ? sql`AND t.holder = ANY(${opts.takesHoldersAllowList!}::text[])` : sql``;
+    // Scope is already bound above; use the shared live/privacy predicate
+    // before ranking and LIMIT, including for holder-unrestricted callers.
+    const readCondition = sql.unsafe(`AND ${pageReadFilter('p', { excludePrivate: opts.excludePrivate }, [], true)}`);
     const rows = await sql`
-      SELECT p.slug, p.source_id, p.title, p.type, p.updated_at, p.emotional_weight,
+      SELECT p.slug, p.source_id, p.title, p.type, p.updated_at, ${sql.unsafe(emotionalSql)} AS emotional_weight,
              COUNT(DISTINCT t.id) AS take_count,
              COALESCE(AVG(t.weight), 0) AS take_avg_weight,
-             (p.emotional_weight * 5)
+             (${sql.unsafe(emotionalSql)} * 5)
                + ln(1 + COUNT(DISTINCT t.id))
                + ${sql.unsafe(recencySql)}
                AS score
         FROM pages p
-        LEFT JOIN takes t ON t.page_id = p.id AND t.active = TRUE
-       WHERE GREATEST(p.updated_at, COALESCE(p.salience_touched_at, p.updated_at)) >= ${boundaryIso}::timestamptz
+        LEFT JOIN takes t ON t.page_id = p.id AND t.active = TRUE ${holderCondition}
+       WHERE ${sql.unsafe(touchedSql)} >= ${boundaryIso}::timestamptz
          ${prefixCondition}
          ${excludeBriefings}
-         ${sourceCondition}
+         ${sourceCondition} ${readCondition}
        GROUP BY p.id
        ORDER BY score DESC
        LIMIT ${limit}
@@ -271,6 +278,9 @@ export async function findAnomalies(deps: PgSalienceDeps, opts: AnomaliesOpts): 
         ? sql`AND p.source_id = ${opts.sourceId}`
         : sql``;
 
+    // Baseline keys, baseline counts and current counts must share visibility.
+    const readCondition = sql.unsafe(`AND ${pageReadFilter('p', { excludePrivate: opts.excludePrivate }, [], true)}`);
+
     // Tag cohort baseline with day densification + zero-fill (codex C4#6).
     const tagBaseline = await sql`
       WITH days AS (
@@ -284,7 +294,7 @@ export async function findAnomalies(deps: PgSalienceDeps, opts: AnomaliesOpts): 
         SELECT DISTINCT t.tag FROM tags t JOIN pages p ON p.id = t.page_id
          WHERE p.updated_at >= ${baselineStart.toISOString()}::timestamptz
            AND p.updated_at <  ${sinceDate.toISOString()}::timestamptz
-           ${sourceCondition}
+           ${sourceCondition} ${readCondition}
       ),
       touched AS (
         SELECT t.tag,
@@ -293,7 +303,7 @@ export async function findAnomalies(deps: PgSalienceDeps, opts: AnomaliesOpts): 
           FROM tags t JOIN pages p ON p.id = t.page_id
          WHERE p.updated_at >= ${baselineStart.toISOString()}::timestamptz
            AND p.updated_at <  ${sinceDate.toISOString()}::timestamptz
-           ${sourceCondition}
+           ${sourceCondition} ${readCondition}
          GROUP BY 1, 2
       )
       SELECT cd.tag AS cohort_value, d.day::text AS day, COALESCE(t.cnt, 0)::int AS count
@@ -313,7 +323,7 @@ export async function findAnomalies(deps: PgSalienceDeps, opts: AnomaliesOpts): 
         SELECT DISTINCT p.type FROM pages p
          WHERE p.updated_at >= ${baselineStart.toISOString()}::timestamptz
            AND p.updated_at <  ${sinceDate.toISOString()}::timestamptz
-           ${sourceCondition}
+           ${sourceCondition} ${readCondition}
       ),
       touched AS (
         SELECT p.type,
@@ -322,7 +332,7 @@ export async function findAnomalies(deps: PgSalienceDeps, opts: AnomaliesOpts): 
           FROM pages p
          WHERE p.updated_at >= ${baselineStart.toISOString()}::timestamptz
            AND p.updated_at <  ${sinceDate.toISOString()}::timestamptz
-           ${sourceCondition}
+           ${sourceCondition} ${readCondition}
          GROUP BY 1, 2
       )
       SELECT cd.type AS cohort_value, d.day::text AS day, COALESCE(t.cnt, 0)::int AS count
@@ -338,7 +348,7 @@ export async function findAnomalies(deps: PgSalienceDeps, opts: AnomaliesOpts): 
         FROM tags t JOIN pages p ON p.id = t.page_id
        WHERE p.updated_at >= ${sinceIso}::timestamptz
          AND p.updated_at <  ${sinceEnd.toISOString()}::timestamptz
-         ${sourceCondition}
+         ${sourceCondition} ${readCondition}
        GROUP BY 1
     `;
     const typeToday = await sql`
@@ -348,7 +358,7 @@ export async function findAnomalies(deps: PgSalienceDeps, opts: AnomaliesOpts): 
         FROM pages p
        WHERE p.updated_at >= ${sinceIso}::timestamptz
          AND p.updated_at <  ${sinceEnd.toISOString()}::timestamptz
-         ${sourceCondition}
+         ${sourceCondition} ${readCondition}
        GROUP BY 1
     `;
 

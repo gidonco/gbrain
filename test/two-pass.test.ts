@@ -12,7 +12,12 @@
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { installFixtureChunks } from './helpers/page-projection.ts';
 import { expandAnchors, hydrateChunks } from '../src/core/search/two-pass.ts';
+import { hybridSearch } from '../src/core/search/hybrid.ts';
+import { importFromContent } from '../src/core/import-file.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
+import { LEGACY_EMBEDDING_CONFIG } from './helpers/legacy-embedding-config.ts';
 
 describe('Layer 7 (A2) — expandAnchors', () => {
   let engine: PGLiteEngine;
@@ -21,6 +26,7 @@ describe('Layer 7 (A2) — expandAnchors', () => {
   let chunkC: number;
 
   beforeAll(async () => {
+    configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: {} });
     engine = new PGLiteEngine();
     await engine.connect({});
     await engine.initSchema();
@@ -31,7 +37,7 @@ describe('Layer 7 (A2) — expandAnchors', () => {
       compiled_truth: 'export function a() { return b(); }',
       timeline: '',
     });
-    await engine.upsertChunks('src-a-ts', [{
+    await installFixtureChunks(engine, 'src-a-ts', [{
       chunk_index: 0,
       chunk_text: 'export function a() { return b(); }',
       chunk_source: 'compiled_truth',
@@ -46,7 +52,7 @@ describe('Layer 7 (A2) — expandAnchors', () => {
       compiled_truth: 'export function b() { return c(); }',
       timeline: '',
     });
-    await engine.upsertChunks('src-b-ts', [{
+    await installFixtureChunks(engine, 'src-b-ts', [{
       chunk_index: 0,
       chunk_text: 'export function b() { return c(); }',
       chunk_source: 'compiled_truth',
@@ -61,7 +67,7 @@ describe('Layer 7 (A2) — expandAnchors', () => {
       compiled_truth: 'export function c() { return 1; }',
       timeline: '',
     });
-    await engine.upsertChunks('src-c-ts', [{
+    await installFixtureChunks(engine, 'src-c-ts', [{
       chunk_index: 0,
       chunk_text: 'export function c() { return 1; }',
       chunk_source: 'compiled_truth',
@@ -89,6 +95,7 @@ describe('Layer 7 (A2) — expandAnchors', () => {
   });
 
   afterAll(async () => {
+    resetGateway();
     await engine.disconnect();
   }, 30_000);
 
@@ -166,6 +173,22 @@ describe('Layer 7 (A2) — expandAnchors', () => {
   test('hydrateChunks with empty array returns []', async () => {
     const rows = await hydrateChunks(engine, []);
     expect(rows).toEqual([]);
+  });
+
+  test('untrusted hybrid retrieval suspends structural expansion that could inject unsealed chunks', async () => {
+    const slug = 'notes/structural-public-anchor';
+    await importFromContent(engine, slug, '---\ntitle: publicanchor\ntype: note\n---\npublicanchor content', { noEmbed: true, forceRechunk: true });
+    const page = (await engine.getPage(slug))!;
+    const vector = new Float32Array(1536); vector[0] = 1;
+    await engine.executeRaw('UPDATE content_chunks SET embedding = $1::vector WHERE page_id = $2', [`[${Array.from(vector)}]`, page.id]);
+    await engine.executeRaw('UPDATE content_chunks SET chunk_text = $1 WHERE id = $2', ['PRIVATE_TWO_PASS_CANARY', chunkB]);
+    const opts = { sourceId: 'default', expansion: false, queryEmbedFn: () => vector, nearSymbol: 'b', walkDepth: 1, limit: 20, excludePrivate: false };
+    const local = await hybridSearch(engine, 'publicanchor', { ...opts, requireSafeChunks: false });
+    expect(JSON.stringify(local)).toContain('PRIVATE_TWO_PASS_CANARY');
+    const remote = await hybridSearch(engine, 'publicanchor', { ...opts, requireSafeChunks: true });
+    expect(remote.map(row => row.slug)).toContain(slug);
+    expect(JSON.stringify(remote)).not.toContain('PRIVATE_TWO_PASS_CANARY');
+    expect(remote.map(row => row.slug)).not.toContain('src-b-ts');
   });
 });
 

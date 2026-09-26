@@ -22,6 +22,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { withSourceFilesystemLock } from '../src/core/minions/source-filesystem.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import {
   __deferredEmbedsPendingForTests,
@@ -95,6 +96,41 @@ describe('serve-sync-runner delegated jobs', () => {
     if (repoPath) rmSync(repoPath, { recursive: true, force: true });
   });
 
+  test('the legacy shared-secret sync lane cannot promote itself to a managed writer', async () => {
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    try {
+      const started = startDelegatedSync(engine, { sourceId: 'default', noPull: true, timeoutSeconds: 30 }, 'token-no-promotion');
+      const terminal = await waitForTerminal(started.jobId!);
+      expect(terminal.state).toBe('error');
+      expect(terminal.jobError).toContain('shared-secret sync delegation');
+      expect(await engine.executeRaw('SELECT id FROM pages')).toHaveLength(0);
+      expect(await engine.executeRaw('SELECT id FROM persistence_requests')).toHaveLength(0);
+    } finally { await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1'); }
+  });
+
+  test('activation after the legacy preflight still cannot grant CLI authority', async () => {
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    let preflight = true;
+    const crossingActivation = new Proxy(engine, { get(target, key) {
+      const value = Reflect.get(target, key, target);
+      if (key === 'executeRaw') return async (sql: string, params?: unknown[]) => {
+        if (preflight && sql === 'SELECT enabled FROM persistence_brain WHERE singleton=1') {
+          preflight = false; return [{ enabled: false }]; // activation occurs after this earlier snapshot
+        }
+        return target.executeRaw(sql, params);
+      };
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    try {
+      const started = startDelegatedSync(crossingActivation, { sourceId: 'default', noPull: true, timeoutSeconds: 30 }, 'token-activation-race');
+      const terminal = await waitForTerminal(started.jobId!);
+      expect(preflight).toBe(false); expect(terminal.state).toBe('error');
+      expect(terminal.jobError).toContain('durable CLI registration');
+      expect(await engine.executeRaw('SELECT id FROM pages')).toHaveLength(0);
+      expect(await engine.executeRaw('SELECT id FROM persistence_requests')).toHaveLength(0);
+    } finally { await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1'); }
+  });
+
   test('start → status polls → done with a real WireSyncResult; embeds deferred', async () => {
     const start = startDelegatedSync(
       engine,
@@ -163,6 +199,10 @@ describe('serve-sync-runner delegated jobs', () => {
     expect(s.state).toBe('done');
     expect(s.result!.status).toBe('partial');
     expect(['timeout', 'pull_timeout', 'stall_timeout']).toContain(s.result!.reason!);
+    expect(s.result!.filesImported).toBe(0);
+    expect(await engine.getPage('topics/alpha')).toBeNull();
+    const [source] = await engine.executeRaw<{ last_commit: string | null }>("SELECT last_commit FROM sources WHERE id = 'default'");
+    expect(source.last_commit).toBeNull();
 
     // Resume: a fresh delegated run completes the remainder.
     const second = startDelegatedSync(engine, { noPull: true, timeoutSeconds: 120, sourceId: 'default' }, 'token-resume');
@@ -171,6 +211,25 @@ describe('serve-sync-runner delegated jobs', () => {
     expect(['first_sync', 'synced', 'up_to_date']).toContain(s2.result!.status);
     expect(await engine.getPage('topics/alpha')).not.toBeNull();
     expect(await engine.getPage('topics/beta')).not.toBeNull();
+  }, 60_000);
+
+  test('abort while waiting for the filesystem lock remains a zero-work partial', async () => {
+    let release!: () => void, entered!: () => void;
+    const acquired = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const writer = withSourceFilesystemLock(engine, repoPath, async () => { entered(); await held; });
+    await acquired;
+    try {
+      const start = startDelegatedSync(engine, { noPull: true, timeoutSeconds: 120, sourceId: 'default' }, 'token-lock-wait');
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(getDelegatedSyncStatus(start.jobId!).state).toBe('running');
+      expect(abortDelegatedSync(start.jobId!).ok).toBe(true);
+      const status = await waitForTerminal(start.jobId!);
+      expect(status.state).toBe('done');
+      expect(status.result!.status).toBe('partial');
+      expect(status.result!.filesImported).toBe(0);
+      expect(await engine.getPage('topics/alpha')).toBeNull();
+    } finally { release(); await writer; }
   }, 60_000);
 
   test('unknown jobId: status and abort answer unknown_job (serve restarted mid-sync)', () => {

@@ -140,7 +140,7 @@ import G_ZIG from '../../assets/wasm/grammars/tree-sitter-zig.wasm' with { type:
 // top-level defs indexed to ZERO symbols). Chunk boundaries change for every
 // previously-merged file, so the bump forces a re-chunk that recovers the
 // erased symbols.
-export const CHUNKER_VERSION = 6;
+export const CHUNKER_VERSION = 7;
 
 // Lazy-loaded tree-sitter module (v0.22.x API: Parser is default export)
 let Parser: typeof import('web-tree-sitter') | null = null;
@@ -745,6 +745,13 @@ async function chunkParsedLanguage(
   language: SupportedCodeLanguage,
   opts: CodeChunkOptions,
 ): Promise<ChunkAndEdgeResult> {
+  // #4669: a language with no TOP_LEVEL_TYPES entry (yaml, json, toml, css,
+  // html, ...) can only reach the no-semantic-nodes fallback below; skip the
+  // WASM load + parse (same output) and the false "parsing unavailable" alarm.
+  if (!TOP_LEVEL_TYPES[language]) {
+    return { chunks: fallbackChunks(source, filePath, language, opts), edges: [] };
+  }
+
   const largeThreshold = opts.largeChunkThresholdTokens ?? 1000;
   const chunkTarget = opts.chunkSizeTokens ?? 300;
   const timeoutMs = resolveChunkerTimeoutMs();

@@ -21,6 +21,9 @@ import {
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
 import { __resetFactsQueueForTests } from '../src/core/facts/queue.ts';
+import { MinionWorker } from '../src/core/minions/worker.ts';
+import type { MinionJobContext } from '../src/core/minions/types.ts';
+import { registerBuiltinHandlers } from '../src/commands/jobs.ts';
 
 let engine: PGLiteEngine;
 
@@ -294,9 +297,6 @@ describe('runFactsBackstop — dedup fast-path', () => {
 
 describe('runFactsBackstop — stub guard routing (v0.34.5)', () => {
   test('bare-name entity routes to legacy DB-only path (no phantom page)', async () => {
-    // Set up: configure default source with a real local_path so the
-    // backstop reaches Phase 5 (fence write) instead of Phase 4 (legacy).
-    // This is the scenario where the stub guard actually fires.
     const { mkdtempSync, rmSync, existsSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -316,9 +316,6 @@ describe('runFactsBackstop — stub guard routing (v0.34.5)', () => {
       //   2. fuzzy match → miss (no title contains noresolvable)
       //   3. prefix expansion → miss (no people/noresolvable-* rows)
       //   4. slugify fallback → 'noresolvable' (bare)
-      // The bare slug then trips the stub guard in writeFactsToFence,
-      // which returns stubGuardBlocked: true, and backstop routes the
-      // fact to engine.insertFact (DB-only).
       chatStub([
         { fact: 'said hello at the meeting', kind: 'event', notability: 'high', entity: 'noresolvable' },
       ]);
@@ -334,14 +331,12 @@ describe('runFactsBackstop — stub guard routing (v0.34.5)', () => {
         // No phantom file at the brain root (this is the whole point of the guard).
         expect(existsSync(join(brainDir, 'noresolvable.md'))).toBe(false);
 
-        // The fact is in the DB with the bare entity_slug. Query directly to
-        // confirm — the routing is the contract under test.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const rows = await (engine as any).db.query(
           `SELECT entity_slug, fact, source_markdown_slug FROM facts WHERE id = $1`,
           [r.fact_ids[0]],
         );
-        expect(rows.rows[0].entity_slug).toBe('noresolvable');
+        expect(rows.rows[0].entity_slug).toBeNull();
         expect(rows.rows[0].fact).toBe('said hello at the meeting');
         // source_markdown_slug is the fence-tracking column; under DB-only
         // fallback it stays null (no .md file backs the row).
@@ -364,8 +359,9 @@ describe('runFactsBackstop — sync.write_through opt-out', () => {
 
     const brainDir = mkdtempSync(join(tmpdir(), 'backstop-write-through-flag-'));
     try {
-      // Fence-eligible setup: local_path set AND a prefixed entity slug —
-      // without the flag this would stub-create people/flag-test.md.
+      await engine.putPage('people/flag-test', {
+        type: 'person', title: 'Flag Test', compiled_truth: '# Existing entity', frontmatter: {},
+      }, { sourceId: 'default' });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await (engine as any).db.query(
         `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
@@ -406,5 +402,55 @@ describe('runFactsBackstop — sync.write_through opt-out', () => {
       await (engine as any).db.query(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
       rmSync(brainDir, { recursive: true, force: true });
     }
+  });
+});
+
+// #4870: the durable facts-absorb payload carries the writer's notabilityFilter
+// verbatim (backstop.ts), but the minion handler (commands/jobs.ts) is the only
+// reader of that value — it must honor every value the ctx union permits, not
+// collapse everything but 'high-only' to 'all'. Drive the registered handler
+// directly with a queued 'medium-and-up' payload (reachable at stock master via
+// `gbrain jobs submit facts-absorb --params ...`).
+describe('facts-absorb minion handler honors the queued notabilityFilter (#4870)', () => {
+  test("a queued 'medium-and-up' payload persists high+medium and drops low", async () => {
+    const worker = new MinionWorker(engine, { queue: 'test' });
+    await registerBuiltinHandlers(worker, engine, { quiet: true });
+    const handler = worker.getHandler('facts-absorb');
+    expect(handler).toBeDefined();
+
+    const page = meetingPage();
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth) VALUES ($1, 'default', 'meeting', $1, $2)`,
+      [page.slug, LONG_BODY],
+    );
+    chatStub([
+      { fact: 'queued-medium-up-high', kind: 'event', notability: 'high', entity: 'people/queue-test' },
+      { fact: 'queued-medium-up-medium', kind: 'event', notability: 'medium', entity: 'people/queue-test' },
+      { fact: 'queued-medium-up-low', kind: 'event', notability: 'low', entity: 'people/queue-test' },
+    ]);
+    const job: MinionJobContext = {
+      id: 1,
+      name: 'facts-absorb',
+      data: { slug: page.slug, sourceId: 'default', source: 'mcp:put_page', notabilityFilter: 'medium-and-up' },
+      attempts_made: 0,
+      signal: new AbortController().signal,
+      deadlineAtMs: null,
+      shutdownSignal: new AbortController().signal,
+      updateProgress: async () => {},
+      updateTokens: async () => {},
+      log: async () => {},
+      isActive: async () => true,
+      readInbox: async () => [],
+    };
+    await handler!(job);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = await (engine as any).db.query(
+      `SELECT fact FROM facts WHERE fact LIKE 'queued-medium-up-%' ORDER BY fact`,
+    );
+    expect(rows.rows.map((r: { fact: string }) => r.fact)).toEqual([
+      'queued-medium-up-high',
+      'queued-medium-up-medium',
+    ]);
   });
 });

@@ -26,6 +26,7 @@ import {
   BudgetExhausted,
   costForUsage,
   extractUsageFromError,
+  isModelPriceable,
   _resetBudgetTrackerWarningsForTest,
 } from '../../../src/core/budget/budget-tracker.ts';
 
@@ -65,8 +66,10 @@ describe('BudgetTracker.reserve', () => {
     expect(costForUsage('google:gemini-2.0-flash', 1_000_000, 1_000_000, 'chat')).toBe(0.5);
   });
 
-  test('default hosted ZeroEntropy reranker has non-zero pricing', () => {
-    expect(costForUsage('zeroentropyai:zerank-2', 1_000_000, 0, 'rerank')).toBe(0.025);
+  // Fork guardrail: the daily AI cap fails closed on unpriced models, so the
+  // default hosted reranker (voyage:rerank-2.5 since upstream v0.48.2) must price.
+  test('default hosted Voyage reranker has non-zero pricing', () => {
+    expect(costForUsage('voyage:rerank-2.5', 1_000_000, 0, 'rerank')).toBe(0.05);
   });
 
   test('passes when under cap with known pricing', () => {
@@ -239,6 +242,56 @@ describe('BudgetTracker.reserve', () => {
     expect(audit.filter((e) => e.event === 'reserve_unpriced').length).toBe(2);
   });
 
+  test('claude-cli:<alias> chat model under a cap prices at the canonical model rate (no no_pricing throw)', () => {
+    // `gbrain enrich --thin` with chat_model = claude-cli:haiku TX2 hard-failed
+    // at reserve() with reason no_pricing at EVERY --max-usd tried: the
+    // gateway reserves with the pre-alias-resolution model string, and
+    // `haiku` is a recipe alias, not a pricing key. lookupPricing resolves
+    // recipe aliases, so the alias prices exactly like the dated id it maps
+    // to — at reserve(), record() and isModelPriceable() alike.
+    expect(isModelPriceable('claude-cli:haiku', 'chat')).toBe(true);
+    const t = new BudgetTracker({ maxCostUsd: 5.0, label: 'test', auditPath });
+    expect(() =>
+      t.reserve({
+        modelId: 'claude-cli:haiku',
+        estimatedInputTokens: 1_000_000,
+        maxOutputTokens: 0,
+        kind: 'chat',
+      }),
+    ).not.toThrow();
+    t.reserve({
+      modelId: 'claude-cli:claude-haiku-4-5-20251001',
+      estimatedInputTokens: 1_000_000,
+      maxOutputTokens: 0,
+      kind: 'chat',
+    });
+    const audit = readAudit();
+    expect(audit.map((e) => e.event)).toEqual(['reserve', 'reserve']);
+    // $1.00/1M input tokens (ANTHROPIC_PRICING['claude-haiku-4-5-20251001']);
+    // the alias and the dated id project the same cost.
+    expect(audit[0].projected_cost_usd).toBeCloseTo(1.0, 6);
+    expect(audit[1].projected_cost_usd).toBe(audit[0].projected_cost_usd);
+  });
+
+  test('claude-cli:<dated-id> resolves Anthropic pricing via the model tail (parity guard for the alias path)', () => {
+    // The DATED id tail ("claude-haiku-4-5-20251001") is itself a bare
+    // ANTHROPIC_PRICING key, so the modelTail fallback prices this call at
+    // the nominal Anthropic per-token rate. The alias path above must land
+    // on exactly this.
+    const t = new BudgetTracker({ maxCostUsd: 5.0, label: 'test', auditPath });
+    expect(() =>
+      t.reserve({
+        modelId: 'claude-cli:claude-haiku-4-5-20251001',
+        estimatedInputTokens: 1_000_000,
+        maxOutputTokens: 0,
+        kind: 'chat',
+      }),
+    ).not.toThrow();
+    const audit = readAudit();
+    expect(audit[0].event).toBe('reserve');
+    expect(audit[0].projected_cost_usd).toBeCloseTo(1.0, 6);
+  });
+
   test('v0.40.6.1: rerank kind for llama-server-reranker prices at $0 (no TX2 throw under --max-cost)', () => {
     // The FREE_LOCAL_RERANK_PROVIDERS contract — local inference costs
     // electricity, not API tokens. Pre-v0.40.6.1 setting --max-cost while
@@ -305,10 +358,10 @@ describe('BudgetTracker.reserve', () => {
     expect(t.totalSpent).toBeGreaterThan(0);
   });
 
-  test('#3223: rerank kind for zeroentropyai:zerank-2 prices from the embedding table (no TX2 throw under --max-cost)', () => {
-    // Pre-fix: `search_mode: tokenmax` defaults the zerank-2 reranker ON
-    // (docs/ai-providers/zeroentropy.md), but lookupPricing's rerank branch
-    // never consulted the embedding pricing table (where ZeroEntropy's
+  test('#3223: rerank kind for voyage:rerank-2.5-lite prices from the embedding table (no TX2 throw under --max-cost)', () => {
+    // Pre-fix: `search_mode: tokenmax` defaults the rerank-2.5-lite reranker ON
+    // (docs/ai-providers/README.md), but lookupPricing's rerank branch
+    // never consulted the embedding pricing table (where Voyage's
     // provider:model-keyed prices live) — so any --max-cost run that
     // reranked TX2 hard-failed with "no pricing entry" even after adding
     // the entry to EMBEDDING_PRICING alone. Fixed by wiring the rerank
@@ -316,7 +369,7 @@ describe('BudgetTracker.reserve', () => {
     const t = new BudgetTracker({ maxCostUsd: 0.0001, label: 'test', auditPath });
     expect(() =>
       t.reserve({
-        modelId: 'zeroentropyai:zerank-2',
+        modelId: 'voyage:rerank-2.5-lite',
         estimatedInputTokens: 3000,
         maxOutputTokens: 0,
         kind: 'rerank',
@@ -325,15 +378,15 @@ describe('BudgetTracker.reserve', () => {
     expect(t.totalSpent).toBe(0); // reserve() only projects; record() below banks it.
     expect(() =>
       t.record({
-        modelId: 'zeroentropyai:zerank-2',
+        modelId: 'voyage:rerank-2.5-lite',
         inputTokens: 3000,
         outputTokens: 0,
         kind: 'rerank',
       }),
     ).not.toThrow();
-    // $0.025/1M * 3000 tokens = $0.000075, under the $0.0001 cap — proves the
-    // real ZeroEntropy price was used, not a $0 fallback.
-    expect(t.totalSpent).toBeCloseTo(0.000075, 9);
+    // $0.02/1M * 3000 tokens = $0.00006, under the $0.0001 cap — proves the
+    // real Voyage price was used, not a $0 fallback.
+    expect(t.totalSpent).toBeCloseTo(0.00006, 9);
   });
 
   test('v0.40.x: local embed providers price at $0 (no TX2 throw under --max-cost)', () => {

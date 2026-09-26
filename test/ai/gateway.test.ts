@@ -46,13 +46,13 @@ describe('gateway configuration', () => {
     expect(getExpansionModel()).toBe('anthropic:claude-haiku-4-5-20251001');
   });
 
-  test('defaults are ZE 1280d as of v0.36.0.0 (D3)', () => {
+  test('defaults are Voyage 1024d as of v0.36.0.0 (D3)', () => {
     // The default flipped from openai:text-embedding-3-large 1536d to
-    // zeroentropyai:zembed-1 1280d in v0.36.0.0. The cost story is in
+    // voyage:voyage-4 1024d in v0.36.0.0. The cost story is in
     // CHANGELOG.md; the rationale lives in src/core/ai/gateway.ts:45-54.
     configureGateway({ env: {} });
-    expect(getEmbeddingModel()).toBe('zeroentropyai:zembed-1');
-    expect(getEmbeddingDimensions()).toBe(1280);
+    expect(getEmbeddingModel()).toBe('voyage:voyage-4');
+    expect(getEmbeddingDimensions()).toBe(1024);
     expect(getExpansionModel()).toBe('anthropic:claude-haiku-4-5-20251001');
   });
 });
@@ -216,6 +216,19 @@ describe('dims.dimsProviderOptions', () => {
   test('Google gemini-embedding returns outputDimensionality', () => {
     const opts = dimsProviderOptions('native-google', 'gemini-embedding-001', 768);
     expect(opts).toEqual({ google: { outputDimensionality: 768 } });
+  });
+
+  test('OpenAI-compatible gemini-embedding returns dimensions', () => {
+    const opts = dimsProviderOptions('openai-compatible', 'google/gemini-embedding-001', 1024);
+    expect(opts).toEqual({ openaiCompatible: { dimensions: 1024 } });
+  });
+
+  test('OpenAI-compatible text-embedding-004 (legacy Gemini id via a router) returns dimensions', () => {
+    // Routers serve the 768-native legacy id alongside gemini-embedding-*;
+    // without the branch a narrower brain gets the native width and fails on
+    // its first embed with a dim mismatch.
+    const opts = dimsProviderOptions('openai-compatible', 'text-embedding-004', 768);
+    expect(opts).toEqual({ openaiCompatible: { dimensions: 768 } });
   });
 
   test('Anthropic returns undefined (no embedding model)', () => {

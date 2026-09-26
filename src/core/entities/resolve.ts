@@ -23,6 +23,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
+import { foldNonDecomposingLatin } from '../latin-fold.ts';
 import { isUndefinedTableError } from '../utils.ts';
 
 /**
@@ -63,6 +64,10 @@ export async function resolveEntitySlug(
   //      while fuzzy is a guess. Live-page verified (page_aliases has no FK).
   const aliased = await tryAliasExact(engine, source_id, trimmed);
   if (aliased) return aliased;
+
+  const basenames = await findExactBasenameCandidates(engine, source_id, trimmed);
+  if (basenames.length === 1) return basenames[0].slug;
+  if (basenames.length > 1) return fallbackSlugify(trimmed);
 
   // 2. Prefix-expansion match: when the input looks like a bare first name
   //    (no slash, no prefix, slugifies to a single short token), try
@@ -160,6 +165,25 @@ function isBareName(raw: string): boolean {
 // doc would trip the ambiguity gate and re-break bare-token resolution.
 const PREFIX_EXPANSION_DIRS = ['people', 'companies', 'hosts', 'projects'] as const;
 
+async function findExactBasenameCandidates(
+  engine: BrainEngine,
+  source_id: string,
+  raw: string,
+): Promise<Array<{ slug: string }>> {
+  const token = slugify(raw);
+  if (raw.includes('/') || !token.includes('-')) return [];
+  try {
+    return await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages
+        WHERE source_id = $1 AND deleted_at IS NULL AND slug = ANY($2::text[])
+        LIMIT 2`,
+      [source_id, [...PREFIX_EXPANSION_DIRS, 'concepts'].map(dir => `${dir}/${token}`)],
+    );
+  } catch {
+    return [];
+  }
+}
+
 /**
  * v0.40.2.0 — resolution-source-tagged variant for trajectory routing.
  *
@@ -197,6 +221,10 @@ export async function resolveEntitySlugWithSource(
 
   const aliased = await tryAliasExact(engine, source_id, trimmed);
   if (aliased) return { slug: aliased, source: 'alias_exact' };
+
+  const basenames = await findExactBasenameCandidates(engine, source_id, trimmed);
+  if (basenames.length === 1) return { slug: basenames[0].slug, source: 'fuzzy_match' };
+  if (basenames.length > 1) return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
 
   if (isBareName(trimmed)) {
     const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, slugify(trimmed));
@@ -448,19 +476,27 @@ async function tryFuzzyMatch(
 }
 
 /**
- * Deterministic slugify: lowercase, replace non-alphanumerics with hyphens,
- * collapse repeated hyphens, trim leading/trailing hyphens.
+ * Deterministic slugify: lowercase, fold accents and stroke letters to their
+ * base letter, replace non-alphanumerics with hyphens, collapse repeated
+ * hyphens, trim leading/trailing hyphens.
  *
  * Exported for tests + callers who want the same fallback shape independently.
  */
 export function slugify(raw: string): string {
-  return raw
-    .toLowerCase()
-    .normalize('NFKD')
-    // NFKD decomposes accents into combining marks (U+0300..U+036F);
-    // strip them before replacing the rest with hyphens so "è" → "e",
-    // not "e" + "-".
-    .replace(/[̀-ͯ]/g, '')
+  // Stroke letters carry no decomposition, so the mark strip cannot fold them
+  // and the sweep below would DELETE them: "Đăng Example" slugged to
+  // "ang-example". Fold after the strip so composed forms reduce in one pass
+  // ("ǿ" → "ø" → "o").
+  const folded = foldNonDecomposingLatin(
+    raw
+      .toLowerCase()
+      .normalize('NFKD')
+      // NFKD decomposes accents into combining marks (U+0300..U+036F);
+      // strip them before replacing the rest with hyphens so "è" → "e",
+      // not "e" + "-".
+      .replace(/[̀-ͯ]/g, ''),
+  );
+  return folded
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-+|-+$/g, '');

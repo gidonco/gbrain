@@ -26,10 +26,11 @@
  *            created it and we trust the gazetteer presence.
  */
 
+import { createHash } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import { isUndefinedTableError } from './utils.ts';
 import { CJK_SLUG_CHARS } from './cjk.ts';
-import { stripCodeBlocks } from './link-extraction.ts';
+import { stripCodeBlocks, isCrossSourceLinksEnabled } from './link-extraction.ts';
 // #4222: shared generic-token reject list — same list gates enrichEntity
 // minting and drives the junk_entity_hubs doctor check.
 import { isGenericEntityToken } from './entity-name-quality.ts';
@@ -81,6 +82,20 @@ export interface GazetteerEntry {
  */
 export type Gazetteer = Map<string, GazetteerEntry[]>;
 
+/**
+ * Fingerprint of every gazetteer entry (source_id, slug, title, tokens) for
+ * the by-mention resume checkpoint. Hashing only the first-token bucket KEYS
+ * missed a new "Acme Labs" beside an existing "Acme Corp", so resumed pages
+ * silently skipped the new entity.
+ */
+export function hashGazetteer(gazetteer: Gazetteer): string {
+  const entries: string[] = [];
+  for (const bucket of gazetteer.values()) {
+    for (const e of bucket) entries.push(`${e.source_id}\0${e.slug}\0${e.title}\0${e.tokens.join(' ')}`);
+  }
+  return createHash('sha256').update(entries.sort().join('\n')).digest('hex').slice(0, 8);
+}
+
 export interface Mention {
   /** Target page slug (the entity being mentioned). */
   slug: string;
@@ -105,6 +120,15 @@ export interface FindMentionsOpts {
   fromSlug: string;
   /** Source id of the page being scanned. Used for cross-source guard. */
   fromSourceId: string;
+  /**
+   * Lift the cross-source guard: a mention in source A of an entity that
+   * lives only in source B produces a mention with the entity's own
+   * `source_id`. Callers derive this from `link_resolution.cross_source`
+   * (via `isCrossSourceLinksEnabled`) so the mention scan follows the same
+   * operator opt-in as wikilink resolution. Default false — the historical
+   * same-source-only posture.
+   */
+  allowCrossSource?: boolean;
 }
 
 // ============================================================
@@ -501,9 +525,14 @@ export async function buildGazetteer(
     }
   }
 
-  // Sort each bucket by token-count DESC so maximal-munch walks longest-first.
+  // Sort each bucket by token-count DESC so maximal-munch walks longest-first;
+  // ties break on (source_id, slug) so the pick among same-name entries is
+  // deterministic instead of following DB row order.
   for (const bucket of gazetteer.values()) {
-    bucket.sort((a, b) => b.tokens.length - a.tokens.length);
+    bucket.sort((a, b) =>
+      (b.tokens.length - a.tokens.length)
+      || a.source_id.localeCompare(b.source_id)
+      || a.slug.localeCompare(b.slug));
   }
   return gazetteer;
 }
@@ -515,19 +544,25 @@ export async function buildGazetteer(
 /**
  * Scan body text for mentions of gazetteer entities. Pure function — no
  * IO. Returns `Mention[]` ordered by offset, deduped per
- * `(fromSlug → entry.slug)` pair (first-mention-only cap).
+ * `(fromSourceId, fromSlug → entry.source_id, entry.slug)` pair
+ * (first-mention-only cap).
  *
  * Matcher is maximal-munch: at each token offset, the longest gazetteer
  * entry that matches the body-token sequence wins. Single-word entries
  * are length-1 maximal matches.
  *
  * Guards (deterministic):
- *  - D13 self-link: skip when `fromSlug === entry.slug`.
- *  - Cross-source: skip when `fromSourceId !== entry.source_id` (mention
- *    in source A of an entity in source B is suppressed; design doc
- *    treats this as deliberate isolation in v1, can relax in a follow-up).
- *  - First-mention-only cap: dedup by `entry.slug` (one link per
- *    target page regardless of how many body mentions there are).
+ *  - D13 self-link: skip when BOTH `source_id` and `slug` match the
+ *    scanning page. Slug uniqueness is `(source_id, slug)`, so once the
+ *    cross-source guard is lifted a foreign namesake is a real target.
+ *  - Cross-source: skip when `fromSourceId !== entry.source_id` UNLESS
+ *    `opts.allowCrossSource` (the `link_resolution.cross_source` opt-in —
+ *    the same switch wikilink resolution honours). A same-name entity in
+ *    the scanning page's OWN source always outranks a cross-source twin,
+ *    whichever way the switch is set (bucket order is length-only, so the
+ *    first maximal match may be the foreign twin).
+ *  - First-mention-only cap: dedup by `(entry.source_id, entry.slug)` (one
+ *    link per target page regardless of how many body mentions there are).
  *
  * Code-block stripping via `stripCodeBlocks` (preserves offsets, so the
  * returned mention offsets index into the ORIGINAL text not the stripped
@@ -544,7 +579,7 @@ export function findMentionedEntities(
   if (tokens.length === 0) return [];
 
   const out: Mention[] = [];
-  const seenSlugs = new Set<string>();
+  const seenTargets = new Set<string>();
   let i = 0;
 
   while (i < tokens.length) {
@@ -586,16 +621,30 @@ export function findMentionedEntities(
       continue;
     }
 
-    // Guards.
-    if (matched.slug === opts.fromSlug) {
-      i += matchedTokens;
-      continue;
-    }
+    // Same-name twin in the scanning page's own source wins over a foreign
+    // one: bucket order is length-only, so `matched` may be the cross-source
+    // twin even when an own-source entry with identical tokens exists.
     if (matched.source_id !== opts.fromSourceId) {
+      const want = matched.tokens;
+      const own = bucket.find(
+        e => e.source_id === opts.fromSourceId
+          && e.tokens.length === want.length
+          && e.tokens.every((t, k) => t === want[k]),
+      );
+      if (own) matched = own;
+    }
+
+    // Guards.
+    if (matched.source_id === opts.fromSourceId && matched.slug === opts.fromSlug) {
       i += matchedTokens;
       continue;
     }
-    if (seenSlugs.has(matched.slug)) {
+    if (!opts.allowCrossSource && matched.source_id !== opts.fromSourceId) {
+      i += matchedTokens;
+      continue;
+    }
+    const target = `${matched.source_id}\0${matched.slug}`;
+    if (seenTargets.has(target)) {
       i += matchedTokens;
       continue;
     }
@@ -606,7 +655,7 @@ export function findMentionedEntities(
       name: matched.title,
       offset: head.offset,
     });
-    seenSlugs.add(matched.slug);
+    seenTargets.add(target);
     i += matchedTokens;
   }
 
@@ -697,6 +746,7 @@ export async function scanStaleMentions(
   if (totalPagesWithMentions === 0) return empty;
 
   const gazetteer = await buildGazetteer(engine);
+  const allowCrossSource = await isCrossSourceLinksEnabled(engine);
 
   // Same bounded page set for both queries so the link rows and the bodies
   // can never describe different pages.
@@ -761,6 +811,7 @@ export async function scanStaleMentions(
       findMentionedEntities(page.body, gazetteer, {
         fromSlug: page.slug,
         fromSourceId,
+        allowCrossSource,
       }).map(m => `${m.source_id}::${m.slug}`),
     );
 

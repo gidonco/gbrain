@@ -1,4 +1,5 @@
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
+import { resetGateway } from '../src/core/ai/gateway.ts';
 import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -8,6 +9,10 @@ import * as path from 'node:path';
 import { withEnv } from './helpers/with-env.ts';
 import { logRerankFailure } from '../src/core/rerank-audit.ts';
 import { doctorSource, doctorFileSource } from './helpers/doctor-source.ts';
+
+// Health fixtures configure fake provider keys. Clear the gateway snapshot as
+// well as each fixture's process env so later tests cannot send real requests.
+afterEach(() => resetGateway());
 
 describe('doctor command', () => {
   test('doctor module exports runDoctor', async () => {
@@ -177,7 +182,7 @@ describe('doctor command', () => {
             reason: 'unknown',
             query_hash: `unknown${i}`,
             doc_count: 30,
-            error_summary: 'ZeroEntropy reranker requires ZEROENTROPY_API_KEY.',
+            error_summary: 'Voyage reranker requires VOYAGE_API_KEY.',
           });
         }
         const check = await checkRerankerHealth({
@@ -188,7 +193,7 @@ describe('doctor command', () => {
         expect(check.status).toBe('warn');
         expect(check.message).toContain('unknown');
         // v0.46.3: the hint names the reranker provider's key generically
-        // (VOYAGE_API_KEY example) — ZE is sunsetting.
+        // (VOYAGE_API_KEY example).
         expect(check.message).toContain('VOYAGE_API_KEY');
       });
     } finally {
@@ -371,6 +376,8 @@ describe('doctor command', () => {
     const source = doctorSource();
     expect(source).toContain('jsonb_integrity');
     expect(source).toContain('markdown_body_completeness');
+    // 0.48.5.1: the truncated-page hint must not name a flag `gbrain sync` does not have.
+    expect(source).not.toContain('gbrain sync --force');
     expect(source).toContain('gbrain repair-jsonb');
   });
 
@@ -413,7 +420,7 @@ describe('doctor command', () => {
       // the pre-#2375 damage class) and one LEGITIMATE string scalar
       // (persistToolExec binds pre-serialized string payloads as-is).
       await engine.executeRaw(
-        `INSERT INTO minion_jobs (id, name, data, status) VALUES (990001, 'doctor-jsonb-test', '{}'::jsonb, 'completed')`,
+        `INSERT INTO minion_jobs (submission_authority, id, name, data, status) VALUES ('{"version":1,"kind":"application"}'::jsonb, 990001, 'doctor-jsonb-test', '{}'::jsonb, 'completed')`,
       );
       await engine.executeRaw(
         `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)

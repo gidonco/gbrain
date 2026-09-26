@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/run-slow-tests.sh
 # Tier 4 sister to run-unit-shard.sh: runs ONLY *.slow.test.ts files.
-# CI runs both; bun run ci:local skips slow tests via run-unit-shard.sh.
+# CI and bun run ci:local both run this lane alongside the unit shards.
 
 set -euo pipefail
 
@@ -18,6 +18,7 @@ cd "$(dirname "$0")/.."
 
 . scripts/lib/test-env.sh
 ensure_pglite_snapshot "run-slow-tests"
+ensure_default_pglite_snapshot "run-slow-tests"
 
 slow_files=()
 while IFS= read -r f; do

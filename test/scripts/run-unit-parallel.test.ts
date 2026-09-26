@@ -20,7 +20,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
-import { execFileSync, spawnSync } from 'child_process';
+import { execFileSync, spawn, spawnSync } from 'child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
@@ -46,6 +46,7 @@ beforeAll(() => {
 
   copyFileSync(PARALLEL_SH_SRC, join(TMPROOT, 'scripts', 'run-unit-parallel.sh'));
   copyFileSync(SHARD_SH_SRC, join(TMPROOT, 'scripts', 'run-unit-shard.sh'));
+  copyFileSync(resolve(REPO_ROOT, 'scripts/sharding.ts'), join(TMPROOT, 'scripts/sharding.ts'));
   copyFileSync(SERIAL_SH_SRC, join(TMPROOT, 'scripts', 'run-serial-tests.sh'));
   chmodSync(join(TMPROOT, 'scripts', 'run-unit-parallel.sh'), 0o755);
   chmodSync(join(TMPROOT, 'scripts', 'run-unit-shard.sh'), 0o755);
@@ -175,6 +176,81 @@ describe('run-unit-parallel.sh timeout escalation contract', () => {
   });
 });
 
+describe('run-unit-parallel.sh operator-interrupt cleanup', () => {
+  it('kills an interrupt-resistant shard when its terminal group receives SIGINT', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-parallel-interrupt-'));
+    let child: ReturnType<typeof spawn> | undefined;
+    let bunPid = 0;
+    try {
+      mkdirSync(join(root, 'scripts', 'lib'), { recursive: true });
+      mkdirSync(join(root, 'test'), { recursive: true });
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      for (const s of ['sharding.ts', 'run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh']) {
+        copyFileSync(resolve(REPO_ROOT, 'scripts', s), join(root, 'scripts', s));
+        chmodSync(join(root, 'scripts', s), 0o755);
+      }
+      copyFileSync(TESTENV_SH_SRC, join(root, 'scripts', 'lib', 'test-env.sh'));
+      writeFileSync(join(root, 'test', 'hang.test.ts'), '// discovered by the shard wrapper\n');
+
+      const fakeBun = join(root, 'bin', 'bun');
+      writeFileSync(fakeBun, `#!/usr/bin/env bash
+[ "${'$'}{1:-}" = "scripts/sharding.ts" ] && exec ${JSON.stringify(process.execPath)} "${'$'}@"
+[ "${'$'}{1:-}" = "test" ] || exit 0
+echo "$$" > "${join(root, 'bun.pid')}"
+trap '' INT TERM
+while true; do sleep 1; done
+`);
+      chmodSync(fakeBun, 0o755);
+
+      child = spawn('bash', [join(root, 'scripts', 'run-unit-parallel.sh'), '--shards', '1'], {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: `${join(root, 'bin')}:${process.env.PATH ?? ''}`,
+          GBRAIN_TEST_NO_MEM_ADAPT: '1',
+          GBRAIN_TEST_SHARD_TIMEOUT: '300',
+        },
+        detached: true,
+        stdio: 'ignore',
+      });
+
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(join(root, 'bun.pid')) && Date.now() < deadline) {
+        await Bun.sleep(25);
+      }
+      expect(existsSync(join(root, 'bun.pid'))).toBe(true);
+      bunPid = Number(readFileSync(join(root, 'bun.pid'), 'utf8').trim());
+
+      const proc = child;
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+        proc.once('exit', (code, signal) => resolveExit({ code, signal }));
+        process.kill(-proc.pid!, 'SIGINT');
+      });
+      // handle_interrupt runs cleanup_children then `exit 130` â€” a raw SIGINT
+      // death would mean the trap never ran (cleanup skipped).
+      expect(exit.code).toBe(130);
+
+      const goneDeadline = Date.now() + 2_000;
+      let liveState = '';
+      do {
+        const probe = spawnSync('ps', ['-o', 'stat=', '-p', String(bunPid)], { encoding: 'utf8' });
+        liveState = (probe.stdout || '').trim();
+        if (!liveState || liveState.startsWith('Z')) break;
+        await Bun.sleep(25);
+      } while (Date.now() < goneDeadline);
+      // A zombie owns no memory and only awaits launchd reaping; any other
+      // state means the cancelled suite is still doing or retaining work.
+      expect(!liveState || liveState.startsWith('Z')).toBe(true);
+    } finally {
+      // Reap the detached tree BEFORE the fixture dir goes: a failed assertion
+      // above must not leave the fake-bun loop (its own process group) alive.
+      if (child?.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } }
+      if (bunPid) { try { process.kill(bunPid, 'SIGKILL'); } catch { /* already gone */ } }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+});
+
 describe('run-unit-parallel.sh no-timeout-binary fallback (rc from shard wait, not watchdog teardown)', () => {
   // Forces the no-gtimeout/no-timeout branch by running the wrapper under a
   // curated PATH that has every tool the scripts call EXCEPT timeout
@@ -194,7 +270,7 @@ describe('run-unit-parallel.sh no-timeout-binary fallback (rc from shard wait, n
     FROOT = mkdtempSync(join(tmpdir(), 'gbrain-parallel-fallback-'));
     mkdirSync(join(FROOT, 'scripts'), { recursive: true });
     mkdirSync(join(FROOT, 'test'), { recursive: true });
-    for (const s of ['run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh', 'lib/test-env.sh']) {
+    for (const s of ['sharding.ts', 'run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh', 'lib/test-env.sh']) {
       mkdirSync(dirname(join(FROOT, 'scripts', s)), { recursive: true });
       copyFileSync(resolve(REPO_ROOT, 'scripts', s), join(FROOT, 'scripts', s));
       chmodSync(join(FROOT, 'scripts', s), 0o755);
@@ -208,7 +284,7 @@ describe('passing', () => {
 
     const bin = join(FROOT, 'bin');
     mkdirSync(bin);
-    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'bun']) {
+    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'tee', 'bun']) {
       const p = Bun.which(tool);
       if (p) symlinkSync(p, join(bin, tool));
     }
@@ -280,7 +356,7 @@ describe('run-unit-parallel.sh OOM rescue lane', () => {
     OROOT = mkdtempSync(join(tmpdir(), 'gbrain-parallel-oom-'));
     mkdirSync(join(OROOT, 'scripts'), { recursive: true });
     mkdirSync(join(OROOT, 'test'), { recursive: true });
-    for (const s of ['run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh', 'lib/test-env.sh']) {
+    for (const s of ['sharding.ts', 'run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh', 'lib/test-env.sh']) {
       mkdirSync(dirname(join(OROOT, 'scripts', s)), { recursive: true });
       copyFileSync(resolve(REPO_ROOT, 'scripts', s), join(OROOT, 'scripts', s));
       chmodSync(join(OROOT, 'scripts', s), 0o755);
@@ -457,7 +533,7 @@ describe('run-unit-parallel.sh no-timeout-binary wedge sentinel (rc 143 at cap â
     WROOT = mkdtempSync(join(tmpdir(), 'gbrain-parallel-wedge-'));
     mkdirSync(join(WROOT, 'scripts'), { recursive: true });
     mkdirSync(join(WROOT, 'test'), { recursive: true });
-    for (const s of ['run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh', 'lib/test-env.sh']) {
+    for (const s of ['sharding.ts', 'run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh', 'lib/test-env.sh']) {
       mkdirSync(dirname(join(WROOT, 'scripts', s)), { recursive: true });
       copyFileSync(resolve(REPO_ROOT, 'scripts', s), join(WROOT, 'scripts', s));
       chmodSync(join(WROOT, 'scripts', s), 0o755);
@@ -475,7 +551,7 @@ describe('hanging', () => { it('sleeps past the shard cap', async () => { await 
     // so the fallback branch executes even on hosts with coreutils.
     const bin = join(WROOT, 'bin');
     mkdirSync(bin);
-    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'touch', 'stat', 'bun']) {
+    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'touch', 'stat', 'tee', 'bun']) {
       const p = Bun.which(tool);
       if (p) symlinkSync(p, join(bin, tool));
     }

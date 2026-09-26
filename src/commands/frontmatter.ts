@@ -1,3 +1,4 @@
+import { assertManagedFilesystemWrite } from '../core/persistence/filesystem-guard.ts';
 /**
  * gbrain frontmatter — Frontmatter validation, audit, and auto-repair.
  *
@@ -206,6 +207,7 @@ async function runValidate(rest: string[]): Promise<void> {
 
   const brainRoot = findBrainRoot(resolved);
   const files = collectFiles(resolved);
+  if (flags.fix && !flags.dryRun) for (const file of files) assertManagedFilesystemWrite(file);
   const results: FileValidation[] = [];
   const backupRunId = makeFrontmatterBackupRunId();
 
@@ -226,6 +228,7 @@ async function runValidate(rest: string[]): Promise<void> {
       const { content: fixed, fixes } = autoFixFrontmatter(content, { filePath: file });
       result.fixesApplied = fixes;
       if (fixes.length > 0 && !flags.dryRun) {
+        assertManagedFilesystemWrite(file);
         result.backupPath = createFrontmatterBackup(file, { sourcePath: resolved, runId: backupRunId });
         writeFileSync(file, fixed, 'utf8');
       }
@@ -478,7 +481,9 @@ async function runGenerate(args: string[]): Promise<void> {
     try { if (lstatSync(absPath).isSymbolicLink()) return; } catch { return; }
 
     let content: string;
-    try { content = readFileSync(absPath, 'utf-8'); } catch { return; }
+    // #4798: strip a UTF-8 BOM so heading-title inference (and --fix's
+    // written body) match what `gbrain sync` / `import` produce.
+    try { content = readFileSync(absPath, 'utf-8').replace(/^\uFEFF/, ''); } catch { return; }
 
     const inferred = inferFrontmatter(relPath, content);
     if (inferred.skipped) {
@@ -504,6 +509,7 @@ async function runGenerate(args: string[]): Promise<void> {
       const newContent = fm + '\n' + content;
       // Safety: write a centralized backup first.
       createFrontmatterBackup(absPath, { sourcePath: brainRoot, runId: backupRunId });
+      assertManagedFilesystemWrite(absPath);
       writeFileSync(absPath, newContent, 'utf-8');
       written++;
     }

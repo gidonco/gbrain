@@ -81,11 +81,13 @@ let hermeticEnsured = false;
  * (today's behavior). `1`/`true` → a per-process empty tmpdir; any other
  * non-empty value is used verbatim as the config-dir path.
  *
- * Opt-in, NOT default: on non-macOS installs the config dir also holds the
- * OAuth session credentials, so pointing the child at an empty dir logs it
- * out (macOS keeps credentials in the keychain and survives). SkillOpt runs
- * that need hermetic measurements (no user-level CLAUDE.md / settings.json /
- * hooks bleeding into rollouts) flip it deliberately — see
+ * Opt-in, NOT default: the config dir also holds the CLI's session
+ * credentials, so the empty-dir form logs the child out wherever the CLI
+ * reads its session from the config dir (observed on macOS with Claude Code
+ * 2.1.x too — #4741; nothing here seeds or looks up credential material).
+ * For hermetic-with-auth use the explicit-path form with a pre-seeded config.
+ * SkillOpt runs that need hermetic measurements (no user-level CLAUDE.md /
+ * settings.json / hooks bleeding into rollouts) flip it deliberately — see
  * docs/guides/skillopt.md, "Hermetic claude-cli rollouts".
  */
 export function resolveHermeticConfigDir(
@@ -457,6 +459,38 @@ interface ParsedToolCall {
 }
 
 /**
+ * Keys the `<use_tools>` protocol reserves on an entry. `type: "tool_use"`
+ * and a `toolu_*` `id` are tolerated leftovers of the Anthropic tool_use
+ * shape; nothing reads them. Any OTHER `type`/`id` value is a real tool
+ * argument (e.g. the allowlisted `list_pages` op's `type` filter) and stays.
+ */
+function isReservedEntryKey(k: string, v: unknown): boolean {
+  if (k === 'name' || k === 'input') return true;
+  if (k === 'type') return v === 'tool_use';
+  if (k === 'id') return typeof v === 'string' && v.startsWith('toolu_');
+  return false;
+}
+
+/**
+ * Resolve the tool input of one `<use_tools>` entry. The protocol asks for
+ * `{name, input}`, but the model sometimes emits the arguments flat on the
+ * entry itself (`{"name": "brain_search", "query": "..."}`), the Anthropic
+ * tool_use shape with the `input` wrapper dropped. Reading only `e.input`
+ * turned every such call into `{}`, and the tool then failed on its missing
+ * required parameter with nothing the model could act on. When `input` is
+ * absent, the entry's non-reserved keys ARE the input; when it is present
+ * it wins verbatim, stray sibling keys ignored.
+ */
+function resolveEntryInput(e: Record<string, unknown>): unknown {
+  if (e.input !== undefined && e.input !== null) return e.input;
+  const flat: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(e)) {
+    if (!isReservedEntryKey(k, v)) flat[k] = v;
+  }
+  return flat;
+}
+
+/**
  * Locate and parse the `<use_tools>...</use_tools>` block in the assistant's
  * raw text response. Returns the parsed tool calls plus whatever prose
  * surrounded the block. Returns an empty `toolCalls` array when no block is
@@ -470,33 +504,56 @@ function extractToolCalls(raw: string): {
 } {
   const openTag = '<use_tools>';
   const closeTag = '</use_tools>';
-  const openIdx = raw.indexOf(openTag);
-  if (openIdx === -1) {
-    return { toolCalls: [], beforeText: raw.trim(), afterText: '' };
+  // No single anchoring rule survives every shape the model emits: a prose
+  // mention of `<use_tools>` BEFORE the block ("Let me use the correct
+  // `<use_tools>` format:") breaks anchoring on the first open tag; a prose
+  // mention of `</use_tools>` before the block breaks anchoring on the first
+  // close tag; and a LITERAL tag inside a JSON string argument (a page body
+  // being written that documents the protocol) breaks "last open tag before
+  // the close" — the inner tag wins, the slice is truncated JSON, and a
+  // valid call is discarded as prose. So: enumerate the (open, close) pairs
+  // outermost-first (earliest open, then each later close) and accept the
+  // first slice that parses as a JSON array. Tags inside argument strings
+  // sit inside an accepted slice or produce a rejected one; they never anchor.
+  // ponytail: O(opens × closes) JSON.parse attempts — tags are a handful per
+  // response; a linear scanner is the upgrade if a payload ever has hundreds.
+  const opens: number[] = [];
+  for (let i = raw.indexOf(openTag); i !== -1; i = raw.indexOf(openTag, i + 1)) opens.push(i);
+  const closes: number[] = [];
+  for (let i = raw.indexOf(closeTag); i !== -1; i = raw.indexOf(closeTag, i + 1)) closes.push(i);
+
+  let parsed: unknown[] | null = null;
+  let openIdx = -1;
+  let closeIdx = -1;
+  let firstError: string | null = null;
+  outer: for (const o of opens) {
+    for (const c of closes) {
+      if (c < o + openTag.length) continue;
+      let inner = raw.slice(o + openTag.length, c).trim();
+      if (inner.startsWith('```')) {
+        inner = inner.replace(/^```(?:json|JSON)?\s*\n?/, '').replace(/\n?```$/, '').trim();
+      }
+      try {
+        const v: unknown = JSON.parse(inner);
+        if (Array.isArray(v)) { parsed = v; openIdx = o; closeIdx = c; break outer; }
+      } catch (e) {
+        firstError ??= e instanceof Error ? e.message : String(e);
+      }
+    }
   }
-  const closeIdx = raw.indexOf(closeTag, openIdx + openTag.length);
-  if (closeIdx === -1) {
-    // Unterminated block — recover gracefully.
+  if (parsed === null) {
+    // A malformed block is a LOST tool call — the caller sees prose and the
+    // turn ends as if the model never called anything. Say so on stderr.
+    // (No pair at all — unterminated, absent, or only orphan close tags — and
+    // a non-array payload both recover silently as before.)
+    if (firstError !== null) {
+      process.stderr.write(`[claude-cli] <use_tools> block failed to parse — tool call discarded: ${firstError}\n`);
+    }
     return { toolCalls: [], beforeText: raw.trim(), afterText: '' };
   }
 
   const beforeText = raw.slice(0, openIdx).trim();
   const afterText = raw.slice(closeIdx + closeTag.length).trim();
-  let inner = raw.slice(openIdx + openTag.length, closeIdx).trim();
-
-  if (inner.startsWith('```')) {
-    inner = inner.replace(/^```(?:json|JSON)?\s*\n?/, '').replace(/\n?```$/, '').trim();
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(inner);
-  } catch {
-    return { toolCalls: [], beforeText: raw.trim(), afterText: '' };
-  }
-  if (!Array.isArray(parsed)) {
-    return { toolCalls: [], beforeText: raw.trim(), afterText: '' };
-  }
 
   const toolCalls: ParsedToolCall[] = [];
   for (const entry of parsed) {
@@ -514,7 +571,7 @@ function extractToolCalls(raw: string): {
     // is deliberately ignored — nothing round-trips it (renderPrompt strips
     // ids on replay; the loop pairs results in-memory within one turn).
     const id = `toolu_claude_cli_${randomUUIDv7()}`;
-    const inputJson = JSON.stringify(e.input ?? {});
+    const inputJson = JSON.stringify(resolveEntryInput(e));
     toolCalls.push({ id, name, input: inputJson });
   }
 

@@ -28,6 +28,7 @@ import {
   resetGateway,
   __setChatTransportForTests,
 } from '../src/core/ai/gateway.ts';
+import { AIConfigError } from '../src/core/ai/errors.ts';
 import {
   runFactsBackstop,
   runFactsPipeline,
@@ -42,9 +43,13 @@ import {
   classifyFactsAbsorbError,
   _resetFactsAbsorbDisconnectedFlagForTests,
 } from '../src/core/facts/absorb-log.ts';
-import { factsAbsorbShouldRetry } from '../src/commands/jobs.ts';
+import { factsAbsorbShouldRetry, registerBuiltinHandlers } from '../src/commands/jobs.ts';
 import { markShortLivedCliProcess, __resetShortLivedCliForTests } from '../src/core/facts/cli-process-mode.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
+import type { MinionHandler } from '../src/core/minions/types.ts';
+import { runPersistenceEffects } from '../src/core/persistence/effects.ts';
+import { localHostId } from '../src/core/persistence/identity.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 
 let engine: PGLiteEngine;
 const PINNED = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GBRAIN_MODEL', 'GBRAIN_HOME'] as const;
@@ -108,7 +113,7 @@ const restoreEnv = () => {
     else process.env[k] = saved[k];
   }
 };
-afterEach(restoreEnv);
+afterEach(async () => { await disposePersistenceConsumer(engine); restoreEnv(); });
 
 afterAll(async () => {
   __setChatTransportForTests(null);
@@ -164,7 +169,8 @@ describe('keyless vs keyed chat_unavailable', () => {
     // Global default would be Anthropic (unservable), but the DB-plane
     // extraction override IS servable with the OpenAI key — the engine-aware
     // gate must admit the work. Short-lived mode routes to the durable minion
-    // (no LLM call executes in-test) so we can also pin the retry policy.
+    // (no LLM call executes in-test) so we can also pin the retry policy and
+    // the handler-default timeout stamped on the submitted row.
     process.env.OPENAI_API_KEY = 'sk-test';
     await engine.setConfig('facts.extraction_model', 'openai:gpt-4o-mini');
     configureGateway({ env: { OPENAI_API_KEY: 'sk-test' } });
@@ -176,13 +182,14 @@ describe('keyless vs keyed chat_unavailable', () => {
     expect(r.mode).toBe('queue');
     expect((r as { enqueued: boolean }).enqueued).toBe(true);
     expect((r as { skipped?: string }).skipped).toBeUndefined();
-    const jobs = await engine.executeRaw<{ max_attempts: number; backoff_delay: number }>(
-      `SELECT max_attempts, backoff_delay FROM minion_jobs WHERE name = 'facts-absorb'`,
+    const jobs = await engine.executeRaw<{ max_attempts: number; backoff_delay: number; timeout_ms: number | string }>(
+      `SELECT max_attempts, backoff_delay, timeout_ms FROM minion_jobs WHERE name = 'facts-absorb'`,
     );
     expect(jobs).toHaveLength(1);
     // Slow-retry policy (R2-5): config drift is fixed on human timescales.
     expect(Number(jobs[0].max_attempts)).toBe(5);
     expect(Number(jobs[0].backoff_delay)).toBe(60_000);
+    expect(Number(jobs[0].timeout_ms)).toBe(10 * 60 * 1000);
   });
 });
 
@@ -272,7 +279,9 @@ describe('extract_facts reason-specific envelopes', () => {
 
 describe('put_page never fails on extraction errors (E1 invariant)', () => {
   test('page write succeeds while the extraction transport throws', async () => {
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
     configureGateway({ chat_model: 'anthropic:claude-sonnet-4-6', env: { ANTHROPIC_API_KEY: 'sk-ant-test' } });
+    await engine.setConfig('facts.extraction_model', 'anthropic:claude-sonnet-4-6');
     __setChatTransportForTests(async () => { throw new Error('simulated provider outage'); });
     const res = await dispatchToolCall(engine, 'put_page', {
       slug: 'e1-invariant-page',
@@ -282,10 +291,20 @@ describe('put_page never fails on extraction errors (E1 invariant)', () => {
     const page = await engine.getPage('e1-invariant-page', { sourceId: 'default' });
     expect(page).toBeTruthy();
     expect(page?.slug).toBe('e1-invariant-page');
-    // Drain the in-process facts queue so the async failure lands, then
-    // confirm it was absorbed as a LOG ROW, not a thrown write failure.
-    const { getFactsQueue } = await import('../src/core/facts/queue.ts');
-    await getFactsQueue().drainPending({ timeout: 10_000 });
+    // Publication accepts durable extraction debt. Run its actual outbox
+    // handoff and registered job handler; the later failure remains visible
+    // while the original canonical receipt and page stay committed.
+    expect(unwrap(res).facts_backstop).toEqual({ queued: true });
+    await runPersistenceEffects(engine, { engine: 'pglite', embedding_disabled: true }, { hostId: localHostId(), limit: 8 });
+    const jobs = await engine.executeRaw<{ id: number; data: Record<string, unknown> }>("SELECT id,data FROM minion_jobs WHERE name='facts-absorb'");
+    expect(jobs).toHaveLength(1);
+    const handlers = new Map<string, MinionHandler>();
+    await registerBuiltinHandlers({ register: (name: string, handler: MinionHandler) => handlers.set(name, handler) } as never, engine, { quiet: true });
+    await expect(handlers.get('facts-absorb')!({
+      ...jobs[0], name: 'facts-absorb', attempts_made: 0, signal: new AbortController().signal,
+      deadlineAtMs: null, shutdownSignal: new AbortController().signal, updateProgress: async () => {},
+      updateTokens: async () => {}, log: async () => {}, isActive: async () => true, readInbox: async () => [],
+    })).rejects.toBeInstanceOf(FactsExtractionError);
     const rows = await absorbRows();
     expect(rows.some((r) => r.summary.startsWith('gateway_error'))).toBe(true);
   });
@@ -351,5 +370,71 @@ describe('coverage-gap additions (ship review)', () => {
     expect(err.message).not.toContain('sk-proj');
     // The cause stays reachable for local debugging.
     expect(String((err as { cause?: unknown }).cause)).toContain('401');
+  });
+
+  test('FactsExtractionError surfaces the cause CONSTRUCTOR name, never its .name or .message', () => {
+    class FakeApiCallError extends Error {
+      constructor(message: string) {
+        super(message);
+        // Deliberately different from the class name, so a test that reads
+        // `.name` instead of `.constructor.name` would fail here — pinning
+        // WHICH property the breadcrumb reads, not just that some name shows up.
+        this.name = 'org_abc123_over_quota';
+      }
+    }
+    const err = new FactsExtractionError('provider_error', 'claude-cli:claude-sonnet-5',
+      new FakeApiCallError('connection reset by peer (org_abc123)'));
+    // The class name is a diagnostic breadcrumb — it survives into the
+    // persisted message so a durable job's `error_text` (which is all that
+    // remains once the in-process `cause` is gone) can still distinguish
+    // "which kind of provider failure" across occurrences.
+    expect(err.message).toContain('(cause=FakeApiCallError)');
+    // The message-carried breadcrumb is the CONSTRUCTOR name, never `.name`
+    // and never `.message` — no room for a provider body to leak through it.
+    expect(err.message).not.toContain('org_abc123');
+    expect(err.message).not.toContain('connection reset');
+    expect(JSON.stringify(err)).not.toContain('org_abc123');
+  });
+
+  test('FactsExtractionError drops a cause-constructor name that is not a plain identifier', () => {
+    // A dependency could in principle construct an Error whose
+    // `constructor.name` is an attacker-chosen string (this needs the
+    // dependency to already run arbitrary code — not a normal provider
+    // error path). The breadcrumb is validated against a plain-identifier
+    // shape and DROPPED (not substituted) rather than trusted verbatim.
+    class WeirdError extends Error {}
+    Object.defineProperty(WeirdError, 'name', { value: 'org_example_secret sk-proj-fake123' });
+    const err = new FactsExtractionError('provider_error', 'openai:gpt-5.2', new WeirdError('x'));
+    expect(err.message).not.toContain('cause=');
+    expect(err.message).not.toContain('org_example_secret');
+    expect(err.message).not.toContain('sk-proj');
+  });
+
+  test('FactsExtractionError appends the whole-run failure class the gateway already computes', () => {
+    // normalizeAIError wraps every provider failure as AIConfigError or
+    // AITransientError, so the class name alone can't tell a 401 from a 400.
+    // classifyGlobalLlmError (the vocabulary ingest_log already uses) walks
+    // the cause chain for the status, so a dead job's error_text reads
+    // `(cause=AIConfigError auth)` while the provider body — and the key it
+    // echoes — still never reaches the message.
+    const err = new FactsExtractionError('provider_error', 'openai:gpt-5.2',
+      new AIConfigError('401 Incorrect API key sk-proj-x', undefined,
+        Object.assign(new Error('x'), { statusCode: 401 })));
+    expect(err.message).toContain('(cause=AIConfigError auth)');
+    expect(err.message).not.toContain('sk-proj');
+    expect(err.message).not.toContain('Incorrect API key');
+  });
+
+  test('FactsExtractionError omits the cause breadcrumb when there is no cause', () => {
+    const err = new FactsExtractionError('truncated_output', 'openai:gpt-5.2');
+    expect(err.message).toBe('[facts-extract] truncated_output (model=openai:gpt-5.2)');
+    expect(err.message).not.toContain('cause=');
+  });
+
+  test('FactsExtractionError omits the cause breadcrumb when cause is not an Error', () => {
+    const err = new FactsExtractionError('provider_error', 'openai:gpt-5.2', 'a raw string cause');
+    expect(err.message).not.toContain('cause=');
+    // The raw cause still stays reachable for local debugging.
+    expect((err as { cause?: unknown }).cause).toBe('a raw string cause');
   });
 });

@@ -27,6 +27,9 @@ import { describe, test as testRaw, expect, beforeAll, afterAll } from 'bun:test
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { keylessBrainEnv } from '../helpers/provider-env.ts';
+import { cliDiagnostic, fixtureDiagnostic } from '../helpers/fixture-diagnostics.ts';
+import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
 
 function test(name: string, fn: () => void | Promise<unknown>): void {
   testRaw(name, fn, 120000);
@@ -34,22 +37,16 @@ function test(name: string, fn: () => void | Promise<unknown>): void {
 
 const CLI = join(__dirname, '..', '..', 'src', 'cli.ts');
 const DATABASE_URL = process.env.DATABASE_URL;
+let hostDatabaseUrl = DATABASE_URL;
 
 interface RunResult { exitCode: number; stdout: string; stderr: string; }
 
 async function spawn(args: string[], home: string, extraEnv: Record<string, string | undefined> = {}): Promise<RunResult> {
-  const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined) env[k] = v;
-  }
-  env.GBRAIN_HOME = home;
-  delete env.GBRAIN_REMOTE_CLIENT_SECRET;
-  for (const [k, v] of Object.entries(extraEnv)) {
-    if (v === undefined) delete env[k];
-    else env[k] = v;
-  }
+  const env = keylessBrainEnv(process.env, home, {
+    GBRAIN_REMOTE_CLIENT_SECRET: undefined, GBRAIN_DATABASE_URL: undefined, DATABASE_URL: hostDatabaseUrl, ...extraEnv,
+  });
   const proc = Bun.spawn({
-    cmd: ['bun', 'run', CLI, ...args],
+    cmd: ['bun', '--no-env-file', 'run', CLI, ...args],
     env,
     stdin: 'ignore',
     stdout: 'pipe',
@@ -74,29 +71,35 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
   let serverPort: number;
   let clientId: string;
   let clientSecret: string;
+  let database: Awaited<ReturnType<typeof isolatedPersistencePostgres>> | undefined;
 
   beforeAll(async () => {
     hostHome = mkdtempSync(join(tmpdir(), 'gbrain-thin-host-'));
     clientHome = mkdtempSync(join(tmpdir(), 'gbrain-thin-client-'));
 
+    // Host health and permanent receipt IDs must not inherit another file's
+    // pages, grants or config. Never truncate the shared shard database.
+    database = await isolatedPersistencePostgres(DATABASE_URL!);
+    const [{ name }] = await database.engine.executeRaw<{ name: string }>('SELECT current_database() AS name');
+    const url = new URL(DATABASE_URL!); url.pathname = `/${name}`;
+    hostDatabaseUrl = url.toString();
+
     // 1. Init host with a real Postgres. `--no-embedding` defers embedding
     //    setup (v0.37.10.0+ requires an explicit embedding provider OR the
     //    deferral flag); thin-client tests exercise the routing surface, not
     //    embedding, so no provider is needed.
-    const init = await spawn(['init', '--non-interactive', '--no-embedding', '--url', DATABASE_URL!], hostHome);
-    if (init.exitCode !== 0) throw new Error(`host init failed: ${init.stderr || init.stdout}`);
+    const init = await spawn(['init', '--non-interactive', '--no-embedding', '--url', hostDatabaseUrl], hostHome);
+    if (init.exitCode !== 0) throw new Error(cliDiagnostic(`host init failed`, init));
 
     // 2. Pick a random free port for serve --http.
     serverPort = 30000 + Math.floor(Math.random() * 30000);
 
     // 3. Spawn serve --http (background, async).
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (v !== undefined) env[k] = v;
-    }
-    env.GBRAIN_HOME = hostHome;
+    const env = keylessBrainEnv(process.env, hostHome, {
+      GBRAIN_REMOTE_CLIENT_SECRET: undefined, GBRAIN_DATABASE_URL: undefined, DATABASE_URL: hostDatabaseUrl,
+    });
     serverProc = Bun.spawn({
-      cmd: ['bun', 'run', CLI, 'serve', '--http', '--port', String(serverPort)],
+      cmd: ['bun', '--no-env-file', 'run', CLI, 'serve', '--http', '--port', String(serverPort)],
       env,
       stdin: 'ignore',
       stdout: 'pipe',
@@ -121,12 +124,12 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
       '--grant-types', 'client_credentials',
       '--scopes', 'read write admin',
     ], hostHome);
-    if (reg.exitCode !== 0) throw new Error(`register-client failed: ${reg.stderr || reg.stdout}`);
+    if (reg.exitCode !== 0) throw new Error(cliDiagnostic(`register-client failed`, reg));
     const parsed = parseRegisterClientOutput(reg.stdout);
     clientId = parsed.clientId;
     clientSecret = parsed.clientSecret;
     if (!clientId || !clientSecret) {
-      throw new Error(`register-client returned unexpected output: ${reg.stdout}`);
+      throw new Error(fixtureDiagnostic("register-client", "missing client ID or secret"));
     }
   });
 
@@ -149,6 +152,8 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
     }
     try { rmSync(hostHome, { recursive: true, force: true }); } catch { /* best-effort */ }
     try { rmSync(clientHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+    await database?.close();
+    hostDatabaseUrl = DATABASE_URL;
   });
 
   test('init --mcp-only succeeds against the live host', async () => {
@@ -159,7 +164,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
       '--oauth-client-id', clientId,
       '--oauth-client-secret', clientSecret,
     ], clientHome);
-    expect(r.exitCode).toBe(0);
+    expect(r.exitCode, cliDiagnostic("thin-client CLI", r)).toBe(0);
     const cfgPath = join(clientHome, '.gbrain', 'config.json');
     expect(existsSync(cfgPath)).toBe(true);
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8'));
@@ -170,8 +175,9 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
 
   test('doctor reports mode: thin-client with all checks green', async () => {
     const r = await spawn(['doctor', '--json'], clientHome);
-    expect(r.exitCode).toBe(0);
     const report = JSON.parse(r.stdout.trim());
+    const failedChecks = report.checks.filter((check: { status: string }) => check.status !== 'ok');
+    expect(r.exitCode, fixtureDiagnostic('thin-client doctor checks', JSON.stringify(failedChecks), [clientId, clientSecret])).toBe(0);
     expect(report.mode).toBe('thin-client');
     expect(report.status).toBe('ok');
     const checkNames = report.checks.map((c: { name: string }) => c.name);
@@ -184,7 +190,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
 
   test('sync is refused with canonical thin-client error', async () => {
     const r = await spawn(['sync'], clientHome);
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode, cliDiagnostic("thin-client CLI", r)).toBe(1);
     // refuseThinClient() emits "(thin-client of <mcp_url>)" with the hyphenated
     // form. Allow either spelling so a future format tweak doesn't false-fail.
     expect(r.stderr).toMatch(/thin[- ]client/);
@@ -193,7 +199,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
 
   test('re-running init refuses without --force', async () => {
     const r = await spawn(['init', '--non-interactive', '--pglite', '--json'], clientHome);
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode, cliDiagnostic("thin-client CLI", r)).toBe(1);
     const parsed = JSON.parse(r.stdout.trim().split('\n').pop()!);
     expect(parsed.reason).toBe('thin_client_config_present');
   });
@@ -267,7 +273,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
       '--grant-types', 'client_credentials',
       '--scopes', 'read write',
     ], hostHome);
-    if (reg.exitCode !== 0) throw new Error(`register-client failed: ${reg.stderr || reg.stdout}`);
+    if (reg.exitCode !== 0) throw new Error(cliDiagnostic(`register-client failed`, reg));
     const parsed = parseRegisterClientOutput(reg.stdout);
     const lowScopeId = parsed.clientId;
     const lowScopeSecret = parsed.clientSecret;
@@ -283,12 +289,12 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
         '--oauth-client-secret', lowScopeSecret,
       ], lowScopeHome);
       if (init.exitCode !== 0) {
-        throw new Error(`low-scope init exit=${init.exitCode}\nstdout:${init.stdout}\nstderr:${init.stderr}`);
+        throw new Error(cliDiagnostic("low-scope init", init));
       }
-      expect(init.exitCode).toBe(0);
+      expect(init.exitCode, cliDiagnostic("thin-client CLI", init)).toBe(0);
 
       const r = await spawn(['remote', 'doctor', '--json'], lowScopeHome);
-      expect(r.exitCode).toBe(1);
+      expect(r.exitCode, cliDiagnostic("thin-client CLI", r)).toBe(1);
       const err = JSON.parse(r.stdout.trim());
       expect(err.status).toBe('error');
       // Either the SDK 401 path or our auth_after_refresh wrap is fine —
@@ -313,8 +319,8 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
    * the search/query keyword arm — the host was inited --no-embedding, so the
    * vector arm degrades and keyword carries the match) and one
    * world-visibility fact (the recall arm; remote callers see world-only).
-   * Idempotent: `put` overwrites the slug, `remember` dedups to
-   * status=duplicate on re-runs against a shared e2e database.
+   * The owned database starts empty; seed once so a failed write or read
+   * remains visible instead of being hidden by a retry.
    */
   async function seedHostMarker(): Promise<void> {
     const content = [
@@ -326,18 +332,13 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
       `The secret phrase is ${G3_MARKER} and it lives only in the host brain.`,
       '',
     ].join('\n');
-    // Shared-DB hygiene: a prior suite in the full-glob run can leave
-    // `sync.repo_path` in the shared config table pointing at a deleted temp
-    // repo, which makes put_page's reverse-write refuse (repo_not_found).
-    // Clear it — suites that need it set it themselves.
-    await spawn(['config', 'unset', 'sync.repo_path'], hostHome);
     const put = await spawn(['put', G3_SLUG, '--content', content], hostHome);
-    if (put.exitCode !== 0) throw new Error(`seed put failed: ${put.stderr || put.stdout}`);
+    if (put.exitCode !== 0) throw new Error(cliDiagnostic(`seed put failed`, put));
     const rem = await spawn(
       ['remember', `The rendezvous codeword is ${G3_MARKER}`, '--provenance', 'thin-client e2e seed'],
       hostHome,
     );
-    if (rem.exitCode !== 0) throw new Error(`seed remember failed: ${rem.stderr || rem.stdout}`);
+    if (rem.exitCode !== 0) throw new Error(cliDiagnostic(`seed remember failed`, rem));
   }
 
   interface VerbRuns {
@@ -350,32 +351,19 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
   }
 
   test('daily-driver verbs (search/query/recall) return host-brain rows with local-parity --json envelopes', async () => {
-    // The e2e database is shared with other suites that truncate pages/facts
-    // in their own setup. Bounded seed+read retry keeps this test honest
-    // under a concurrent wipe without loosening any assertion: every attempt
-    // seeds first, then requires ALL six runs to be complete before pinning.
-    let runs: VerbRuns | null = null;
-    for (let attempt = 0; attempt < 3 && !runs; attempt++) {
-      await seedHostMarker();
-      // Local-engine runs (host HOME) and routed runs (thin-client HOME) of
-      // the same three verbs. All reads — safe to run in parallel.
-      const [hostSearch, clientSearch, hostQuery, clientQuery, hostRecall, clientRecall] = await Promise.all([
-        spawn(['search', G3_MARKER, '--json'], hostHome),
-        spawn(['search', G3_MARKER, '--json'], clientHome),
-        spawn(['query', G3_MARKER, '--json'], hostHome),
-        spawn(['query', G3_MARKER, '--json'], clientHome),
-        spawn(['recall', '--grep', G3_MARKER, '--json'], hostHome),
-        spawn(['recall', '--grep', G3_MARKER, '--json'], clientHome),
-      ]);
-      const candidate: VerbRuns = { hostSearch, clientSearch, hostQuery, clientQuery, hostRecall, clientRecall };
-      const complete =
-        Object.values(candidate).every(r => r.exitCode === 0) &&
-        [hostSearch, clientSearch, hostQuery, clientQuery].every(r => r.stdout.includes(G3_SLUG)) &&
-        [hostRecall, clientRecall].every(r => r.stdout.includes(G3_MARKER));
-      if (complete) runs = candidate;
-    }
-    if (!runs) {
-      throw new Error('marker rows never materialized across 3 seed+read attempts (concurrent shared-DB truncation?)');
+    await seedHostMarker();
+    // Local and routed reads of the same owned host brain run concurrently.
+    const [hostSearch, clientSearch, hostQuery, clientQuery, hostRecall, clientRecall] = await Promise.all([
+      spawn(['search', G3_MARKER, '--json'], hostHome),
+      spawn(['search', G3_MARKER, '--json'], clientHome),
+      spawn(['query', G3_MARKER, '--json'], hostHome),
+      spawn(['query', G3_MARKER, '--json'], clientHome),
+      spawn(['recall', '--grep', G3_MARKER, '--json'], hostHome),
+      spawn(['recall', '--grep', G3_MARKER, '--json'], clientHome),
+    ]);
+    const runs: VerbRuns = { hostSearch, clientSearch, hostQuery, clientQuery, hostRecall, clientRecall };
+    for (const [verb, result] of Object.entries(runs)) {
+      expect(result.exitCode, cliDiagnostic(verb, result, [clientId, clientSecret])).toBe(0);
     }
 
     // search + query --json: top-level shape is an ARRAY of result rows
@@ -431,7 +419,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
     const r = await spawn(['search', G3_MARKER, '--json'], clientHome, {
       GBRAIN_REMOTE_CLIENT_SECRET: 'gbrain_cs_definitely_not_the_real_secret',
     });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode, cliDiagnostic("thin-client CLI", r)).toBe(1);
     // No fabricated results — stdout stays empty on the error path.
     expect(r.stdout.trim()).toBe('');
     // Canonical RemoteMcpError surface. mcp-client maps the non-401 /token
@@ -459,10 +447,10 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
     // routed default timeout is 30s. Anything near the 120s test timeout is
     // the hang this test exists to forbid.
     expect(Date.now() - t0).toBeLessThan(60_000);
-    expect(search.exitCode).toBe(1);
+    expect(search.exitCode, cliDiagnostic("thin-client CLI", search)).toBe(1);
     expect(search.stdout.trim()).toBe('');
     expect(search.stderr).toContain(`Cannot reach http://127.0.0.1:${serverPort}/mcp`);
-    expect(recall.exitCode).toBe(1);
+    expect(recall.exitCode, cliDiagnostic("thin-client CLI", recall)).toBe(1);
     expect(recall.stdout.trim()).toBe('');
     expect(recall.stderr).toMatch(/OAuth discovery failed/);
   });

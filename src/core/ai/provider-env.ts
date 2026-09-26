@@ -35,10 +35,10 @@ export function mergedProviderEnv(
   const fromConfig: Record<string, string> = {};
   if (cfg?.openai_api_key) fromConfig.OPENAI_API_KEY = cfg.openai_api_key;
   if (cfg?.anthropic_api_key) fromConfig.ANTHROPIC_API_KEY = cfg.anthropic_api_key;
-  if (cfg?.zeroentropy_api_key) fromConfig.ZEROENTROPY_API_KEY = cfg.zeroentropy_api_key;
   if (cfg?.openrouter_api_key) fromConfig.OPENROUTER_API_KEY = cfg.openrouter_api_key;
   if (cfg?.voyage_api_key) fromConfig.VOYAGE_API_KEY = cfg.voyage_api_key;
   if (cfg?.dashscope_api_key) fromConfig.DASHSCOPE_API_KEY = cfg.dashscope_api_key;
+  if (cfg?.deepseek_api_key) fromConfig.DEEPSEEK_API_KEY = cfg.deepseek_api_key;
   // Same seam for LiteLLM + Together, closed alongside litellm's chat
   // touchpoint (v0.42.61.0 made litellm a full chat provider, so the
   // config-plane gap started biting daemon/launchd/MCP contexts the same

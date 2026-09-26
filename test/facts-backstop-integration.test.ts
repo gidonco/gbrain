@@ -101,6 +101,73 @@ describe('runFactsPipeline (extract_facts MCP op path) — response shape stabil
     expect(r.entity_slugs).toEqual([]);
   });
 
+  test('#4755: a null-like entity STRING from the extractor lands unparented, never under entity_slug=\'null\'', async () => {
+    // The extractor prompt asks for JSON null on subjectless statements; LLMs
+    // routinely emit the string "null" / "None" instead. Pre-fix that token
+    // reached the resolver, fell back to itself as the slug, and the facts
+    // were filed under a page that cannot exist.
+    chatStub([
+      { fact: 'a gap statement with no subject', kind: 'fact', notability: 'medium', entity: 'null' },
+      { fact: 'a second subjectless statement', kind: 'fact', notability: 'medium', entity: 'None' },
+    ]);
+    const r = await runFactsPipeline('turn with no subject', {
+      engine,
+      sourceId: 'default',
+      sessionId: 'null-entity-test',
+      source: 'mcp:extract_facts',
+    });
+    expect(r.inserted).toBe(2);
+    for (const id of r.fact_ids) {
+      const rows = await engine.executeRaw<{ entity_slug: string | null }>(
+        'SELECT entity_slug FROM facts WHERE id = $1', [id],
+      );
+      expect(rows[0].entity_slug).toBeNull();
+    }
+    expect(r.entity_slugs).toEqual([]);
+  });
+
+  test('unresolved entity references stay unparented with provenance in every storage mode', async () => {
+    const { mkdtempSync, readdirSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { _resetWriteThroughCacheForTest } = await import('../src/core/write-through.ts');
+    const dir = mkdtempSync(join(tmpdir(), 'unresolved-facts-'));
+    try {
+      for (const mode of ['thin-client', 'local', 'disabled']) {
+        await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+          [mode === 'thin-client' ? null : dir]);
+        await engine.setConfig('sync.write_through', mode === 'disabled' ? 'false' : 'true');
+        _resetWriteThroughCacheForTest();
+        chatStub(['Unresolved Example', 'people/missing-example'].map(entity => ({
+          fact: `${mode}: ${entity} supplied a useful fact`, entity, kind: 'fact', notability: 'high',
+        })));
+        const result = await runFactsPipeline('A conversation with unresolved entities', {
+          engine, sourceId: 'default', sessionId: `unresolved-${mode}`, source: 'mcp:extract_facts',
+          sourceSlug: 'meetings/provenance-example',
+        });
+        expect(result.inserted).toBe(2);
+        expect(result.entity_slugs).toEqual([]);
+        const rows = await engine.executeRaw<{
+          entity_slug: string | null; source: string; context: string | null; row_num: number | null;
+        }>(`SELECT entity_slug, source, context, row_num FROM facts WHERE source_id = 'default' AND source_session = $1`,
+          [`unresolved-${mode}`]);
+        expect(rows).toHaveLength(2);
+        for (const row of rows) {
+          expect(row.entity_slug).toBeNull();
+          expect(row.source).toBe('mcp:extract_facts');
+          expect(row.context).toBe('meetings/provenance-example');
+          expect(row.row_num).toBeNull();
+        }
+        expect(readdirSync(dir)).toEqual([]);
+      }
+    } finally {
+      await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`);
+      await engine.unsetConfig('sync.write_through');
+      _resetWriteThroughCacheForTest();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('empty extraction → zero counts (no NaN, no undefined)', async () => {
     chatStub([]);
     const r = await runFactsPipeline('nothing claim-worthy here', {

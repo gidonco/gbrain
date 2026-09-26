@@ -1,3 +1,5 @@
+import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
+import { postprocessManagedSynthesis } from './synthesize-postprocess.ts';
 /**
  * Synthesize phase (v0.23; #4152 two-stage cascade) — conversation-to-brain
  * pipeline. Cheap-model triage gates frontier-model synthesis:
@@ -452,6 +454,8 @@ async function runPhaseSynthesizeInner(
       );
     }
 
+    const maintenance = opts.dryRun ? null : await maintenancePreflight(engine, opts.sourceId ?? 'default', opts.brainDir);
+
     // v0.32.6 M2: pre-fetch prior contradictions from the most recent probe
     // run (if any). Surfaced as an informational block to the synthesize
     // subagent so it knows which slugs it should reconcile if it writes to
@@ -486,13 +490,11 @@ async function runPhaseSynthesizeInner(
       process.stderr.write(`[dream] warning: verdict cache sweep failed: ${e instanceof Error ? e.message : String(e)}\n`);
     }
 
-    // Scored triage (#4152): cached in dream_verdicts, judged on miss by the
-    // utility-tier model through a bounded pool with a wall-clock miss budget.
-    // Provider-aware judge client routes through gateway.chat, so any
-    // configured provider works (Anthropic, DeepSeek, OpenRouter, Voyage,
-    // Ollama, llama-server, etc.); an unreachable provider degrades
-    // per-transcript inside the pass.
-    const pass = await runTriagePass(engine, transcripts, {
+    const synthesisIdentity = maintenance ? `${opts.sourceId ?? 'default'}/${maintenance.writer.sourceIncarnation}` : opts.sourceId ?? 'default';
+    const retainedKeys = maintenance ? await loadSuccessfulSynthesisKeys(engine, opts.sourceId ?? 'default', 'dream:synth-v2:') : [];
+    const retained = new Set(transcripts.filter(t => maintenance && findSynthV2Completion(retainedKeys, t.filePath,
+      t.contentHash.slice(0, 16), synthesisIdentity)).map(t => t.filePath));
+    const pass = await runTriagePass(engine, transcripts.filter(t => !retained.has(t.filePath)), {
       model: config.triage.model,
       maxChars: config.triage.maxChars,
       maxTokens: config.triage.maxTokens,
@@ -502,6 +504,9 @@ async function runPhaseSynthesizeInner(
       signal: opts.signal,
       rescue: rescueConfigOf(config.triage),
     }, opts.yieldDuringPhase);
+    pass.reports.push(...transcripts.filter(t => retained.has(t.filePath)).map(t => ({ filePath: t.filePath,
+      worth: true, score: null, content_type: null, cached: true, reasons: ['retained_completed_output'] })));
+    pass.cacheHits += retained.size;
     const verdicts = pass.reports;
 
     // Read-time gate: retuning dream.triage.threshold (or the rescue knobs)
@@ -517,7 +522,7 @@ async function runPhaseSynthesizeInner(
     // deferred/unreliable (no reachable provider, mid-run gateway error). A
     // provider outage must never read as mass rejection.
     const degradedCount = pass.reports.filter(
-      r => r.score === null && !r.deferred && !r.unreliable,
+      r => r.score === null && !r.worth && !r.deferred && !r.unreliable,
     ).length;
     const triageDetails = {
       threshold: config.triage.threshold,
@@ -634,10 +639,8 @@ async function runPhaseSynthesizeInner(
     const skipReports: Array<{ filePath: string; reason: string }> = [];
 
     const maxCharsPerChunk = computeChunkCharBudget(config.model, config.maxPromptTokens);
-    const successfulLegacyKeys = await loadSuccessfulLegacySynthesisKeys(
-      engine,
-      cycleSourceId,
-    );
+    const successfulLegacyKeys = maintenance ? [] : await loadSuccessfulSynthesisKeys(engine, cycleSourceId, 'dream:synth:');
+    const successfulV2Keys = maintenance ? retainedKeys : await loadSuccessfulSynthesisKeys(engine, cycleSourceId, 'dream:synth-v2:');
 
     // Per-source daily submission cap (D2D: default 0 = disabled; opt-in
     // backstop via dream.synthesize.max_submissions_per_source_per_day).
@@ -703,6 +706,37 @@ async function runPhaseSynthesizeInner(
         continue;
       }
 
+      // Same rule for the synth-v2 key family. Without it a transcript whose
+      // children already COMPLETED coalesced onto them via queue.add's
+      // idempotency key — free for the daily cap, but only AFTER the link
+      // manifest (up to 20 searches) was built — and the coalesced children
+      // re-entered writtenRefs, so their old pages were quote-repaired,
+      // restamped and re-embedded every night with nothing new written.
+      const v2Completion = findSynthV2Completion(
+        successfulV2Keys, t.filePath, hash16, synthesisIdentity,
+      );
+      if (v2Completion) {
+        if (maintenance) {
+          const key = `dream:synth-v2:${encodeURIComponent(synthesisIdentity)}:filename:${encodeURIComponent(basename(t.filePath))}:${hash16}`;
+          const jobs = await engine.executeRaw<{ id: number; idempotency_key: string }>(
+            "SELECT id,idempotency_key FROM minion_jobs WHERE status='completed' AND (idempotency_key=$1 OR left(idempotency_key,length($1)+2)=$1||':c') ORDER BY id", [key]);
+          for (const job of jobs) {
+            childIds.push(job.id);
+            jobRawSource.set(job.id, t.filePath);
+            const chunk = job.idempotency_key.match(/:c(\d+)of\d+$/);
+            if (chunk) chunkInfo.set(job.id, { idx: Number(chunk[1]), hash6 });
+          }
+          continue;
+        }
+        skipReports.push({
+          filePath: t.filePath,
+          reason: v2Completion === 'chunked'
+            ? 'already_synthesized_v2_chunked'
+            : 'already_synthesized_v2_single_chunk',
+        });
+        continue;
+      }
+
       const chunks = splitTranscriptByBudget(t.content, t.contentHash, maxCharsPerChunk);
 
       // D5 cap hit: log + skip; do NOT write to dream_verdicts. Closes the
@@ -730,9 +764,9 @@ async function runPhaseSynthesizeInner(
       if (capActive && submittedToday + chunks.length > dailyCap) {
         const fileKeys = chunks.length > 1
           ? chunks.map((_, i) =>
-              `dream:synth-v2:${encodeURIComponent(opts.sourceId ?? 'default')}` +
+              `dream:synth-v2:${encodeURIComponent(synthesisIdentity)}` +
               `:filename:${encodeURIComponent(basename(t.filePath))}:${hash16}:c${i}of${chunks.length}`)
-          : [`dream:synth-v2:${encodeURIComponent(opts.sourceId ?? 'default')}` +
+          : [`dream:synth-v2:${encodeURIComponent(synthesisIdentity)}` +
               `:filename:${encodeURIComponent(basename(t.filePath))}:${hash16}`];
         let existingKeys = 0;
         try {
@@ -795,6 +829,7 @@ async function runPhaseSynthesizeInner(
             // #4117: validated per-lane namespaces.
             config.reflectionsPrefix,
             config.originalsPrefix,
+            config.mode,
           ),
           model: subagentModel,
           max_turns: config.maxTurns,
@@ -815,7 +850,7 @@ async function runPhaseSynthesizeInner(
         // complete filename remain explicit so equal bytes in different source
         // or filename namespaces do not collide.
         const synthesisKey =
-          `dream:synth-v2:${encodeURIComponent(opts.sourceId ?? 'default')}` +
+          `dream:synth-v2:${encodeURIComponent(synthesisIdentity)}` +
           `:filename:${encodeURIComponent(basename(t.filePath))}:${hash16}`;
         const idempotency_key = isChunked
           ? `${synthesisKey}:c${i}of${chunks.length}`
@@ -1029,7 +1064,8 @@ async function runPhaseSynthesizeInner(
     // rescued/passed transcript whose child declined to write (task D) is
     // distinguishable from a triage miss in the phase telemetry.
     const jobsWithPages = new Set<number>();
-    const writtenRefs = await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages);
+    let writtenRefs = await collectChildPutPageSlugs(engine, childIds, chunkInfo, cycleSourceId, jobRawSource, jobsWithPages);
+    let finalizedRefs = writtenRefs;
 
     // F1b/F4b: mechanical quote verify/repair on this phase's newly-created
     // pages, BEFORE the provenance stamp / reverse-write / embed sweep so the
@@ -1037,7 +1073,13 @@ async function runPhaseSynthesizeInner(
     // repaired body. Fail-open (abort still unwinds); kill switch:
     // dream.synthesize.quote_verify=false.
     let quoteVerifyStats: QuoteVerifyStats | null = null;
-    if (config.quoteVerify && writtenRefs.length > 0) {
+    if (maintenance) {
+      const processed = await postprocessManagedSynthesis(engine, maintenance, writtenRefs, childIds, jobRawSource,
+        worthProcessing, { cycleDate: summaryDate, quoteVerify: config.quoteVerify, signal: opts.signal });
+      writtenRefs = processed.writtenRefs;
+      finalizedRefs = processed.finalizedRefs;
+      quoteVerifyStats = config.quoteVerify ? processed.stats : null;
+    } else if (config.quoteVerify && writtenRefs.length > 0) {
       const transcriptsForVerify = new Map<string, TranscriptForVerify>(
         worthProcessing.map(t => [t.filePath, { content: t.content, hash6: t.contentHash.slice(0, 6) }]),
       );
@@ -1049,22 +1091,17 @@ async function runPhaseSynthesizeInner(
       }
     }
 
-    // #2569: persist the dream-output identity marker into the DB frontmatter
-    // of every child-written page BEFORE reverse-rendering, so generated pages
-    // are queryable (`frontmatter->>'dream_generated'`) and a later put_page
-    // write-through (which re-renders from the DB row) can't erase the stamp.
-    await stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal);
+    if (!maintenance) await stampDreamProvenance(engine, writtenRefs, summaryDate, opts.signal);
 
     // Dual-write: reverse-render each DB row → markdown file.
-    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
+    const reverseWriteCount = maintenance ? (maintenance.binding ? writtenRefs.length : 0)
+      : await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId, opts.signal);
 
-    // Summary index page (deterministic; orchestrator-written via direct
-    // engine.putPage so no allow-list path needed).
     const summarySlug = buildDreamSummarySlug(config.outputRoot, summaryDate);
-    // Back-compat: writeSummaryPage takes string[] for display; map refs back to slugs.
     const writtenSlugs = writtenRefs.map(r => r.slug);
     if (SUMMARY_SLUG_RE.test(summarySlug)) {
-      await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, writtenSlugs, childOutcomes, cycleSourceId, opts.signal);
+      const preserveSummary = maintenance && !writtenRefs.length && await engine.readPageSnapshot(summarySlug, { sourceId: cycleSourceId });
+      if (!preserveSummary) await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, finalizedRefs.map(r => r.slug), childOutcomes, cycleSourceId, opts.signal, maintenance);
     }
 
     // #4077: nothing below runs for a cancelled cycle — no phase-end embed
@@ -1214,11 +1251,11 @@ async function runPhaseSynthesizeInner(
     // still-unknown keys) AND nothing was budget-deferred (#4168 adversarial:
     // "deferred transcripts retry next cycle" is a lie if the next cycle is
     // cooldown-skipped for half a day).
-    if (failedChildren.length === 0 && budgetExhaustedDeferrals.length === 0) {
+    if (failedChildren.length === 0 && budgetExhaustedDeferrals.length === 0 && pass.deferred === 0) {
       await engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
     } else {
       process.stderr.write(
-        `[dream] synthesize: ${failedChildren.length}/${childOutcomes.length} child job(s) incomplete + ${budgetExhaustedDeferrals.length} deferred — cooldown NOT stamped so the next run retries them.\n`,
+        `[dream] synthesize: ${failedChildren.length}/${childOutcomes.length} child job(s) incomplete + ${budgetExhaustedDeferrals.length} synthesis-budget deferred + ${pass.deferred} triage-deferred — cooldown NOT stamped so the next run retries them.\n`,
       );
     }
 
@@ -2613,6 +2650,7 @@ function buildSynthesisPrompt(
   // config-resolved values.
   reflectionsPrefix = `${outputRoot}/personal/reflections`,
   originalsPrefix = `${outputRoot}/originals/ideas`,
+  mode: 'agentic' | 'oneshot' = 'agentic',
 ): string {
   // #4348: UTC projection retained here on purpose — this is a slug-name
   // hint for undated sources, not calendar provenance.
@@ -2629,12 +2667,18 @@ function buildSynthesisPrompt(
     ? `${t.filePath} (chunk ${chunkIdx + 1}/${chunkTotal})`
     : t.filePath;
   // #4216 rule-2 wording: with a manifest present, the model is pointed at the
-  // pre-resolved candidates FIRST (the search tool stays available on the
-  // agentic path; the oneshot path has no tools, and this same prompt must be
-  // byte-identical across a oneshot attempt and its agentic fallback).
-  const crossRefRule = linkManifestBlock
-    ? 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Pick targets from the LINK CANDIDATES above (or another page you write in this response); use the search tool, if available, only when no candidate fits.'
-    : 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Use the search tool to find existing pages first.';
+  // pre-resolved candidates FIRST. The agentic prompt keeps its search-tool
+  // guidance; oneshot has no tools, so it may use only pre-resolved candidates
+  // or pages in the same JSON batch. (A oneshot child's prompt is stored as
+  // data.prompt and reused verbatim by its in-job agentic fallback, which
+  // keeps its tools in the schema and merely loses the search hint.)
+  const crossRefRule = mode === 'agentic'
+    ? (linkManifestBlock
+      ? 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Pick targets from the LINK CANDIDATES above (or another page you write in this response); use the search tool, if available, only when no candidate fits.'
+      : 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to existing brain content. Use the search tool to find existing pages first.')
+    : (linkManifestBlock
+      ? 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`). Pick its target from the LINK CANDIDATES above or another page in this response.'
+      : 'Cross-reference compulsively: every new page MUST contain at least one wikilink (e.g., `[ref](people/jane-doe)` or `[[people/jane-doe]]`) to another page in this response.');
   // OV-7: the write allow-list must live in the PROMPT, not only in the
   // put_page tool schema — the oneshot path never sees a tool schema.
   const allowedPathsBlock = allowedSlugPrefixes.length > 0
@@ -2650,7 +2694,7 @@ CONTEXT
 OUTPUT POLICY (ALL of these are required)
 1. Quote the user verbatim. Quotation marks are ONLY for spans reproducible EXACTLY from the transcript below — if you cannot reproduce a span exactly, paraphrase it WITHOUT quotation marks. Do not paraphrase memorable phrasings you can quote exactly.
 2. ${crossRefRule}
-3. Do NOT write to any path outside the ALLOWED WRITE PATHS above${allowedSlugPrefixes.length > 0 ? '' : ' (shown in the put_page schema)'}.
+3. Do NOT write to any path outside the ALLOWED WRITE PATHS above${allowedSlugPrefixes.length > 0 ? '' : mode === 'agentic' ? ' (shown in the put_page schema)' : '; if none are listed, return the Task D skip response'}.
 4. Slug discipline: lowercase alphanumeric and hyphens only, slash-separated segments. NO underscores, NO file extensions.
 5. Self-contained opening: begin every new page's body with a 2-3 sentence summary that a reader unfamiliar with this transcript could understand on its own, before any quotes or detail. Do not assume the reader has the source conversation for context.
 6. Preserve concrete facts: carry the specific numbers, dates, dollar amounts, names, and who-decided-what OF the salient content you write about, exactly as the transcript states them. Do not add routine logistics for their own sake.
@@ -2663,16 +2707,18 @@ A. Reflections (self-knowledge, pattern recognition, emotional processing):
 B. Originals (new ideas, frames, theses, mental models):
    slug: \`${originalsPrefix}/${dateHint}-<idea-slug>-${hashSuffix}\`
 
-C. People mentions: ${linkManifestBlock ? 'check LINK CANDIDATES (and the search tool, when available) first' : 'search first, when a search tool is available'}; never write over an existing person page (the orchestrator handles people enrichment via timeline entries — your job is the reflection/original synthesis, NOT modifying existing person pages).
+C. People mentions: ${mode === 'agentic'
+    ? (linkManifestBlock ? 'check LINK CANDIDATES (and the search tool, when available) first' : 'search first, when a search tool is available')
+    : (linkManifestBlock ? 'check LINK CANDIDATES first' : 'do not create or modify person pages')}; never write over an existing person page (the orchestrator handles people enrichment via timeline entries — your job is the reflection/original synthesis, NOT modifying existing person pages).
 
 D. If nothing in this transcript meets the bar (significance filter already passed but the content is still routine), return without writing anything.
 
 TRANSCRIPT (${transcriptHeader})
 ---
 ${chunkText}
----
-
-When done, briefly list the slugs you wrote in your final message so the orchestrator can audit.`;
+---${mode === 'agentic'
+    ? '\n\nWhen done, briefly list the slugs you wrote in your final message so the orchestrator can audit.'
+    : ''}`;
 }
 
 function sanitizeForSlug(s: string): string {
@@ -2752,12 +2798,15 @@ async function collectChildPutPageSlugs(
 }
 
 /**
- * D8: load every `completed` legacy job key in the pre-v2 path-based
- * family `dream:synth:<filePath>:<hash16>[:c<i>of<n>]`. Used at fan-out
- * time to detect transcripts already synthesized under an old key shape;
- * those should NOT be re-submitted under v2 keys. (v2 keys start with
- * `dream:synth-v2:` and don't match the LIKE prefix — the queue's own
- * idempotency dedupe already covers them.)
+ * Load every `completed` subagent job key in one synthesis key family for
+ * one source. Called once per phase per family so the submit loop can skip
+ * transcripts already synthesized BEFORE building their link manifest:
+ *  - D8 legacy `dream:synth:<filePath>:<hash16>[:c<i>of<n>]` (pre-v2 shape;
+ *    must not be re-submitted under v2 keys);
+ *  - current `dream:synth-v2:<source>:filename:<basename>:<hash16>[:c<i>of<n>]`
+ *    (the queue's idempotency dedupe would coalesce these too, but only after
+ *    the manifest build, and the coalesced children would re-enter writtenRefs).
+ * `dream:synth:%` does not match `dream:synth-v2:` keys.
  *
  * Plain `status = 'completed'` deliberately mirrors the queue-level
  * idempotency semantics the legacy keys relied on: a completed job blocks
@@ -2769,9 +2818,10 @@ async function collectChildPutPageSlugs(
  * Loads source-scoped completions once per phase; no schema additions
  * and no repeated history scan for each transcript.
  */
-async function loadSuccessfulLegacySynthesisKeys(
+async function loadSuccessfulSynthesisKeys(
   engine: BrainEngine,
   sourceId: string,
+  keyPrefix: 'dream:synth:' | 'dream:synth-v2:',
 ): Promise<string[]> {
   const rows = await engine.executeRaw<{ idempotency_key: string }>(
     `SELECT idempotency_key
@@ -2779,10 +2829,44 @@ async function loadSuccessfulLegacySynthesisKeys(
       WHERE name = 'subagent'
         AND status = 'completed'
         AND COALESCE(NULLIF(data->>'source_id', ''), 'default') = $1
-        AND idempotency_key LIKE 'dream:synth:%'`,
-    [sourceId],
+        AND idempotency_key LIKE $2`,
+    [sourceId, `${keyPrefix}%`],
   );
   return rows.map(row => row.idempotency_key);
+}
+
+/**
+ * Mirror of findLegacyCompletion for the synth-v2 key family (grammar as
+ * produced by the submit loop / parsed by `parseSynthV2Key`): `'single'` when
+ * the unchunked key completed, `'chunked'` when a FULL `:c0of<n>`..`:c<n-1>of<n>`
+ * set completed, null otherwise (a cancelled row never counts).
+ */
+function findSynthV2Completion(
+  successfulKeys: string[],
+  filePath: string,
+  hash16: string,
+  sourceId: string,
+): 'single' | 'chunked' | null {
+  const prefix =
+    `dream:synth-v2:${encodeURIComponent(sourceId)}` +
+    `:filename:${encodeURIComponent(basename(filePath))}:${hash16}`;
+  const chunkSets = new Map<number, Set<number>>();
+  for (const key of successfulKeys) {
+    if (key === prefix) return 'single';
+    if (!key.startsWith(prefix + ':c')) continue;
+    const chunk = /:c(\d+)of(\d+)$/.exec(key);
+    if (!chunk) continue;
+    const i = Number(chunk[1]);
+    const n = Number(chunk[2]);
+    if (n < 1 || i < 0 || i >= n) continue;
+    let seen = chunkSets.get(n);
+    if (!seen) chunkSets.set(n, seen = new Set());
+    seen.add(i);
+  }
+  for (const [n, seen] of chunkSets) {
+    if (seen.size === n) return 'chunked';
+  }
+  return null;
 }
 
 /**
@@ -2823,25 +2907,6 @@ function findLegacyCompletion(
 
 // ── Dream-provenance DB stamp (#2569) ────────────────────────────────
 
-/**
- * Persist the dream-output identity marker (`dream_generated: true` +
- * `dream_cycle_date`) into the `pages.frontmatter` JSONB row for every page
- * a synthesize child wrote. Render-time `frontmatterOverrides` alone only
- * reach the markdown FILE — the DB row stayed unstamped, so DB consumers
- * couldn't enumerate generated pages and a later put_page write-through
- * (which re-renders from the DB row) silently erased the marker.
- *
- * Plain UPDATE through executeRawJsonb (raw object bound to $4::jsonb —
- * never JSON.stringify into a ::jsonb cast; engine-parity safe, no new
- * engine method). Best-effort per row: a stamp failure never kills the
- * phase (the render-time override still covers the file).
- *
- * #4337: reruns preserve the FIRST dream cycle date. `dream_cycle_date`
- * stays the stable back-compat query key and `dream_created_cycle_date`
- * is its explicit immutable mirror — an existing value of either (created
- * mirror wins) beats this run's cycleDate, so a re-synthesis pass can't
- * rewrite a page's provenance to the maintenance run's date.
- */
 async function stampDreamProvenance(
   engine: BrainEngine,
   refs: Array<{ slug: string; source_id: string; raw_source?: string }>,
@@ -2980,6 +3045,7 @@ async function writeSummaryPage(
   childOutcomes: Array<{ jobId: number; status: string }>,
   sourceId = 'default',
   signal?: AbortSignal,
+  maintenance?: MaintenanceAuthority | null,
 ): Promise<void> {
   throwIfAborted(signal, '[dream] synthesize summary');
   const completed = childOutcomes.filter(c => c.status === 'completed').length;
@@ -3040,16 +3106,9 @@ async function writeSummaryPage(
     { type: 'note' as string, title: `Dream cycle ${summaryDate}`, tags: ['dream-cycle'] },
   );
 
-  // Direct engine.putPage — orchestrator write, no subagent context, no
-  // allow-list check (server-side viaSubagent=false). The summary slug is
-  // pre-validated against SUMMARY_SLUG_RE in the caller.
-  // Importing put_page via operations.ts would re-run namespace logic
-  // unnecessarily; we go straight to the engine.
   const { parseMarkdown } = await import('../markdown.ts');
   const parsed = parseMarkdown(fullMarkdown);
-  // #1586: summary lands in the cycle's resolved source too — otherwise the
-  // children live in the named source while the index drifts to 'default'.
-  await engine.putPage(summarySlug, {
+  if (!maintenance) await engine.putPage(summarySlug, {
     type: parsed.type,
     title: parsed.title,
     compiled_truth: parsed.compiled_truth,
@@ -3057,14 +3116,6 @@ async function writeSummaryPage(
     frontmatter: parsed.frontmatter,
   }, { sourceId });
 
-  // Also write to disk (orchestrator dual-write). #4506: the unconditional
-  // file write dirtied clean source repos (an untracked
-  // dream-cycle-summaries/<date>.md after every nightly run). Two
-  // suppressors, both leaving the DB row untouched:
-  //   - explicit knob `dream.synthesize.summary_file_write=false|0|off`
-  //     (default ON — back-compat for brains that expect the dual-write);
-  //   - a gbrain.yml storage tier that declares the summary slug `db_only`
-  //     (the DB/file-plane split the reporter expected to cover this path).
   const fileWriteRaw = (await engine.getConfig('dream.synthesize.summary_file_write'))?.trim().toLowerCase();
   const fileWriteEnabled = !(fileWriteRaw === 'false' || fileWriteRaw === '0' || fileWriteRaw === 'off');
   let dbOnlyTier = false;
@@ -3078,8 +3129,18 @@ async function writeSummaryPage(
     }
   }
   if (!fileWriteEnabled || dbOnlyTier) {
+    if (maintenance) {
+      const snapshot = await engine.readPageSnapshot(summarySlug, { sourceId, includeDeleted: true });
+      await publishMaintenancePage(engine, maintenance, summarySlug, fullMarkdown, { expectedRevision: snapshot?.revision ?? null, file: false });
+    }
     const why = !fileWriteEnabled ? 'dream.synthesize.summary_file_write=off' : 'db_only storage tier';
     process.stderr.write(`[dream] summary file-write skipped (${why}): ${summarySlug} lives in the DB only\n`);
+    return;
+  }
+
+  if (maintenance) {
+    const snapshot = await engine.readPageSnapshot(summarySlug, { sourceId, includeDeleted: true });
+    await publishMaintenancePage(engine, maintenance, summarySlug, fullMarkdown, { expectedRevision: snapshot?.revision ?? null });
     return;
   }
   try {

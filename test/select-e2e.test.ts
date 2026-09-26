@@ -20,6 +20,11 @@ const ALL_E2E = [
   "test/e2e/dream.test.ts",
   "test/e2e/code-indexing.test.ts",
   "test/e2e/engine-parity.test.ts",
+  "test/e2e/chunk-canonical-text-privacy.test.ts",
+  "test/e2e/engine-content-privacy.test.ts",
+  "test/e2e/legacy-chunk-privacy.test.ts",
+  "test/e2e/read-enrichment-privacy.test.ts",
+  "test/e2e/remote-privacy-journeys.test.ts",
   "test/e2e/graph-quality.test.ts",
   "test/e2e/http-transport.test.ts",
   "test/e2e/integrity-batch.test.ts",
@@ -99,6 +104,36 @@ describe("classify", () => {
 });
 
 describe("selectTests", () => {
+  test.each([
+    "src/core/attendance-repair.ts",
+    "src/commands/extract-attendance-repair.ts",
+  ])("attendance repair changes select their PostgreSQL parity entry: %s", (path) => {
+    expect(selectTests({
+      changedFiles: [path],
+      allE2ETests: [
+        "test/e2e/attendance-repair-postgres.test.ts",
+        "test/e2e/attendance-retrieval-postgres.test.ts",
+        "test/e2e/graph-quality.test.ts",
+      ],
+      map: E2E_TEST_MAP,
+    })).toEqual(["test/e2e/attendance-repair-postgres.test.ts"]);
+  });
+
+  test("shared derived-link changes retain attendance retrieval and repair parity", () => {
+    expect(selectTests({
+      changedFiles: ["src/core/derived-links.ts"],
+      allE2ETests: [
+        "test/e2e/attendance-repair-postgres.test.ts",
+        "test/e2e/attendance-retrieval-postgres.test.ts",
+        "test/e2e/graph-quality.test.ts",
+      ],
+      map: E2E_TEST_MAP,
+    })).toEqual([
+      "test/e2e/attendance-repair-postgres.test.ts",
+      "test/e2e/attendance-retrieval-postgres.test.ts",
+    ]);
+  });
+
   test("case 1: empty diff -> all E2E", () => {
     expect(select([])).toEqual(ALL_E2E.slice().sort());
   });
@@ -111,9 +146,20 @@ describe("selectTests", () => {
 
   test("case 3: single mapped src -> only mapped tests", () => {
     expect(select(["src/core/search/intent.ts"])).toEqual([
+      "test/e2e/chunk-canonical-text-privacy.test.ts",
+      "test/e2e/engine-content-privacy.test.ts",
+      "test/e2e/legacy-chunk-privacy.test.ts",
+      "test/e2e/projection-readiness-currency.test.ts",
+      "test/e2e/projection-statistics-postgres.test.ts",
+      "test/e2e/read-enrichment-privacy.test.ts",
+      "test/e2e/remote-privacy-journeys.test.ts",
       "test/e2e/search-exclude.test.ts",
       "test/e2e/search-quality.test.ts",
+      "test/e2e/search-query-contract-postgres.test.ts",
+      "test/e2e/search-readiness-http.test.ts",
       "test/e2e/search-swamp.test.ts",
+      "test/e2e/unsupported-embedding-identity-postgres.test.ts",
+      "test/e2e/vector-candidate-safety-postgres.test.ts",
     ]);
   });
 
@@ -154,6 +200,24 @@ describe("selectTests", () => {
     expect(select(["src/cli.ts"])).toEqual(ALL_E2E.slice().sort());
   });
 
+  test("an unmapped change forces all tests even beside a mapped change or direct test edit", () => {
+    for (const changes of [
+      ["src/core/search/intent.ts", "src/new-unmapped.ts"],
+      ["src/new-unmapped.ts", "src/core/search/intent.ts"],
+      ["test/e2e/sync.test.ts", "src/new-unmapped.ts"],
+    ]) {
+      expect(select(changes)).toEqual(ALL_E2E.slice().sort());
+    }
+  });
+
+  test("an empty map entry cannot declare an unknown change covered", () => {
+    expect(selectTests({
+      changedFiles: ["src/covered.ts", "src/empty.ts"],
+      allE2ETests: ALL_E2E,
+      map: { "src/covered.ts": ["test/e2e/sync.test.ts"], "src/empty.ts": [] },
+    })).toEqual(ALL_E2E.slice().sort());
+  });
+
   test("case 9: directly-modified test file is included", () => {
     // Touching a test file directly with no other src changes:
     // - test/e2e/foo.test.ts is in changedFiles
@@ -172,9 +236,20 @@ describe("selectTests", () => {
       "src/core/search/intent.ts",
     ]);
     expect(result).toEqual([
+      "test/e2e/chunk-canonical-text-privacy.test.ts",
+      "test/e2e/engine-content-privacy.test.ts",
+      "test/e2e/legacy-chunk-privacy.test.ts",
+      "test/e2e/projection-readiness-currency.test.ts",
+      "test/e2e/projection-statistics-postgres.test.ts",
+      "test/e2e/read-enrichment-privacy.test.ts",
+      "test/e2e/remote-privacy-journeys.test.ts",
       "test/e2e/search-exclude.test.ts",
       "test/e2e/search-quality.test.ts",
+      "test/e2e/search-query-contract-postgres.test.ts",
+      "test/e2e/search-readiness-http.test.ts",
       "test/e2e/search-swamp.test.ts",
+      "test/e2e/unsupported-embedding-identity-postgres.test.ts",
+      "test/e2e/vector-candidate-safety-postgres.test.ts",
     ]);
   });
 

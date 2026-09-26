@@ -21,6 +21,7 @@ import {
   runSubagentOneshot,
   parseOneshotResponse,
   extractWikilinkTargets,
+  ONESHOT_SYSTEM,
   type OneshotArgs,
 } from '../../src/core/minions/handlers/subagent-oneshot.ts';
 import type { ChatResult } from '../../src/core/ai/gateway.ts';
@@ -51,12 +52,16 @@ const SUFFIX = 'abc123';
 const GOOD_SLUG_A = `wiki/personal/reflections/2026-08-16-topic-${SUFFIX}`;
 const GOOD_SLUG_B = `wiki/originals/ideas/2026-08-16-idea-${SUFFIX}`;
 
-function chatStub(text: string, stopReason: ChatResult['stopReason'] = 'end'): OneshotArgs['_chat'] {
+function chatStub(
+  text: string,
+  stopReason: ChatResult['stopReason'] = 'end',
+  outputTokens = 50,
+): OneshotArgs['_chat'] {
   return (async () => ({
     text,
     blocks: [{ type: 'text', text }],
     stopReason,
-    usage: { input_tokens: 100, output_tokens: 50, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    usage: { input_tokens: 100, output_tokens: outputTokens, cache_read_tokens: 0, cache_creation_tokens: 0 },
     model: 'anthropic:claude-sonnet-4-6',
     providerId: 'anthropic',
   })) as OneshotArgs['_chat'];
@@ -82,7 +87,13 @@ async function makeCtx(data: SubagentHandlerData): Promise<MinionJobContext> {
   };
 }
 
-function makeArgs(ctx: MinionJobContext, data: SubagentHandlerData, chatText: string, stop: ChatResult['stopReason'] = 'end'): OneshotArgs {
+function makeArgs(
+  ctx: MinionJobContext,
+  data: SubagentHandlerData,
+  chatText: string,
+  stop: ChatResult['stopReason'] = 'end',
+  outputTokens = 50,
+): OneshotArgs {
   const tools = buildBrainTools({
     subagentId: ctx.id,
     engine,
@@ -101,7 +112,7 @@ function makeArgs(ctx: MinionJobContext, data: SubagentHandlerData, chatText: st
     leaseKey: 'anthropic:messages',
     maxConcurrent: 32,
     leaseTtlMs: 120_000,
-    _chat: chatStub(chatText, stop),
+    _chat: chatStub(chatText, stop, outputTokens),
   };
 }
 
@@ -126,6 +137,12 @@ const VALID_RESPONSE = JSON.stringify({
 });
 
 describe('parseOneshotResponse', () => {
+  test('system contract requires JSON string escaping', () => {
+    expect(ONESHOT_SYSTEM).toContain('valid JSON string');
+    expect(ONESHOT_SYSTEM).toContain('unescaped quotes');
+    expect(ONESHOT_SYSTEM).toContain('literal newlines');
+  });
+
   test('parses the contract, applies title/type defaults', () => {
     const p = parseOneshotResponse('```json\n{"pages":[{"slug":"a/b","body":"text"}],"skipped":false}\n```');
     expect(p).not.toBeNull();
@@ -167,6 +184,24 @@ describe('extractWikilinkTargets', () => {
 });
 
 describe('runSubagentOneshot', () => {
+  test('pending write receipts retain the whole ledger and retry without another provider call', async () => {
+    const ctx = await makeCtx(DATA); const args = makeArgs(ctx, DATA, VALID_RESPONSE);
+    const realTool = args.putPageTool!; const realChat = args._chat!;
+    let chatCalls = 0; let pending = true; const ids: unknown[] = [];
+    args._chat = (async (options: Parameters<typeof realChat>[0]) => { chatCalls++; return realChat(options); }) as typeof realChat;
+    args.putPageTool = { ...realTool, execute: async (input, context) => {
+      const id = (input as Record<string, unknown>).request_id; ids.push(id);
+      if (pending) return { request_id: id, state: 'queued', retry_after_ms: 100 };
+      return realTool.execute(input, context);
+    } };
+    await expect(runSubagentOneshot(args)).rejects.toMatchObject({ code: 'write_pending', writeRequest: { state: 'queued' } });
+    const rows = await engine.executeRaw<{ status: string }>('SELECT status FROM subagent_tool_executions WHERE job_id=$1', [ctx.id]);
+    expect(rows).toHaveLength(2); expect(rows.every(row => row.status === 'pending')).toBe(true);
+    pending = false;
+    expect((await runSubagentOneshot(args)).kind).toBe('done');
+    expect(chatCalls).toBe(1); expect(ids[1]).toBe(ids[0]);
+  });
+
   test('happy path: validates, writes both pages via put_page, ledger rows land, transcript persisted', async () => {
     const ctx = await makeCtx(DATA);
     const outcome = await runSubagentOneshot(makeArgs(ctx, DATA, VALID_RESPONSE));
@@ -325,6 +360,40 @@ describe('runSubagentOneshot', () => {
     expect(outcome).toEqual({ kind: 'fallback', reason: 'length', tokens: FB_TOKENS });
   });
 
+  test("malformed output at the cap → length fallback for ambiguous 'end'/'other' reasons", async () => {
+    for (const stop of ['end', 'other'] as const) {
+      const ctx = await makeCtx(DATA);
+      const outcome = await runSubagentOneshot(
+        makeArgs(ctx, DATA, VALID_RESPONSE.slice(0, 50), stop, 8192),
+      );
+      expect(outcome).toEqual({
+        kind: 'fallback',
+        reason: 'length',
+        tokens: { ...FB_TOKENS, out: 8192 },
+      });
+    }
+  });
+
+  test('malformed output below the cap remains unparseable', async () => {
+    const ctx = await makeCtx(DATA);
+    const outcome = await runSubagentOneshot(
+      makeArgs(ctx, DATA, VALID_RESPONSE.slice(0, 50), 'end', 8191),
+    );
+    expect(outcome).toEqual({
+      kind: 'fallback',
+      reason: 'unparseable',
+      tokens: { ...FB_TOKENS, out: 8191 },
+    });
+  });
+
+  test('valid JSON at the cap is accepted', async () => {
+    const ctx = await makeCtx(DATA);
+    const outcome = await runSubagentOneshot(
+      makeArgs(ctx, DATA, '{"pages":[],"skipped":true,"skip_reason":"routine"}', 'end', 8192),
+    );
+    expect(outcome.kind).toBe('done');
+  });
+
   test('duplicate slugs within one batch → bad_slug (second write would silently overwrite the first)', async () => {
     const ctx = await makeCtx(DATA);
     const resp = JSON.stringify({
@@ -446,10 +515,15 @@ describe('runSubagentOneshot', () => {
     await engine.executeRaw(
       `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status)
        VALUES ($1, 1, 'oneshot-deadbeef-p0', 'brain_put_page', $2::text::jsonb, 'pending')`,
-      [ctx.id, JSON.stringify({ slug: GOOD_SLUG_A, content: `Recovered body. [[${GOOD_SLUG_B}]]` })],
+      [ctx.id, JSON.stringify({ request_id: '02df181d-4594-4f1b-88de-61dc80338687', slug: GOOD_SLUG_A, content: `Recovered body. [[${GOOD_SLUG_B}]]` })],
     );
     let chatCalls = 0;
     const args = makeArgs(ctx, DATA, VALID_RESPONSE);
+    const realTool = args.putPageTool!;
+    args.putPageTool = { ...realTool, execute: async (input, context) => {
+      expect((input as Record<string, unknown>).request_id).toBe('02df181d-4594-4f1b-88de-61dc80338687');
+      return realTool.execute(input, context);
+    } };
     const inner = args._chat!;
     args._chat = (async (opts: Parameters<NonNullable<OneshotArgs['_chat']>>[0]) => {
       chatCalls++;
@@ -501,6 +575,10 @@ describe('runSubagentOneshot', () => {
             `SELECT count(*)::int AS n FROM subagent_tool_executions
               WHERE job_id = $1 AND tool_use_id LIKE 'oneshot-%'`, [ctx.id]);
           pendingAtFirstWrite = rows[0]!.n;
+          const identities = await engine.executeRaw<{ request_id: string }>(
+            `SELECT input->>'request_id' AS request_id FROM subagent_tool_executions WHERE job_id=$1`, [ctx.id]);
+          expect(new Set(identities.map(row => row.request_id)).size).toBe(2);
+          for (const row of identities) expect(row.request_id).toMatch(/^[0-9a-f-]{36}$/);
         }
         return realTool.execute(input, execCtx);
       },
