@@ -160,7 +160,7 @@ affected_sweep() {
   git -C "$WT" rev-parse -q --verify "$tag^{commit}" >/dev/null || die "cannot derive upstream tag from branch name ($tag)"
   local base="$HOME/gbrain-baseline"
   local list="$LOGDIR/affected-files.txt" res="$LOGDIR/affected-results.txt"
-  (cd "$WT" && find test -type f -name '*.test.ts' ! -name '*.e2e.*' \
+  (cd "$WT" && find test -type f -name '*.test.ts' ! -name '*.e2e.*' ! -path 'test/e2e/*' \
      | grep -E 'gateway|autopilot|budget|expansion|ocr|rerank|embed' | sort) >"$list"
   say "affected sweep: $(wc -l <"$list" | tr -d ' ') files, one process each (log: $res)"
   : >"$res"; local regress=0 f
